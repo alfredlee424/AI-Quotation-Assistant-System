@@ -268,7 +268,7 @@ with right_col:
 
         if not st.session_state.quote_confirmed:
             confirm = st.button(
-                "✅ 確認建立正式報價單（寫入 ordqdt）",
+                "✅ 確認建立正式報價單（寫入 ordqdt_ai）",
                 type="primary",
                 use_container_width=True,
             )

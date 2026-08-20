@@ -11,7 +11,7 @@ UI、AI Agent 與計價引擎均不得直接執行 SQL，只能呼叫此模組�
   - get_options_by_path()   : 取得某路徑下所有可選項目
   - get_part_quantity()     : 取得部件標準用量與裁切量
   - get_option_price()      : 取得選項採購成本（用於計價）
-  - save_quote_snapshot()   : 將報價快照寫入 ordqdt
+  - save_quote_snapshot()   : 將報價快照寫入 ordqdt_ai
   - get_quote_snapshot()    : 讀取已建立的報價快照
 """
 
@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from database.connection import get_db
-from database.models import Ordspd, Ordspe, Ordqty, Ordqdt
+from database.models import Ordspd, Ordspe, Ordqty, ordqdt_ai
 from config import WORKGROUP
 
 
@@ -268,7 +268,7 @@ def get_option_price(
 
 
 # ============================================================
-# 7. save_quote_snapshot - 將報價快照寫入 ordqdt
+# 7. save_quote_snapshot - 將報價快照寫入 ordqdt_ai
 # ============================================================
 
 def save_quote_snapshot(
@@ -276,7 +276,7 @@ def save_quote_snapshot(
     workgroup: str = WORKGROUP,
 ) -> str:
     """
-    將報價明細清單寫入 ordqdt（報價快照）。
+    將報價明細清單寫入 ordqdt_ai（報價快照）。
 
     Args:
         items: list[dict]，每筆至少包含：
@@ -296,7 +296,7 @@ def save_quote_snapshot(
     db = _session()
     try:
         for item in items:
-            snapshot = Ordqdt(
+            snapshot = ordqdt_ai(
                 workgroup=item.get("workgroup", workgroup),
                 ref_no=item["ref_no"],
                 seq_no=item["seq_no"],
@@ -315,6 +315,7 @@ def save_quote_snapshot(
                 amount=item.get("amount"),
                 unit=item.get("unit", "PCS"),
                 status=item.get("status", "C"),
+                transferred=item.get("transferred", "N"),
                 adddate=item.get("adddate"),
                 addusrno=item.get("addusrno", "SYS"),
             )
@@ -334,7 +335,7 @@ def save_quote_snapshot(
 
 def get_quote_snapshot(ref_no: str, workgroup: str = WORKGROUP) -> list[dict]:
     """
-    依報價單號取得 ordqdt 所有明細。
+    依報價單號取得 ordqdt_ai 所有明細。
 
     Returns:
         list[dict]
@@ -342,12 +343,12 @@ def get_quote_snapshot(ref_no: str, workgroup: str = WORKGROUP) -> list[dict]:
     db = _session()
     try:
         rows = (
-            db.query(Ordqdt)
+            db.query(ordqdt_ai)
             .filter(
-                Ordqdt.workgroup == workgroup,
-                Ordqdt.ref_no == ref_no,
+                ordqdt_ai.workgroup == workgroup,
+                ordqdt_ai.ref_no == ref_no,
             )
-            .order_by(Ordqdt.seq_no)
+            .order_by(ordqdt_ai.seq_no)
             .all()
         )
         return [
@@ -369,6 +370,7 @@ def get_quote_snapshot(ref_no: str, workgroup: str = WORKGROUP) -> list[dict]:
                 "amount": r.amount,
                 "unit": r.unit,
                 "status": r.status,
+                "transferred": r.transferred,
             }
             for r in rows
         ]

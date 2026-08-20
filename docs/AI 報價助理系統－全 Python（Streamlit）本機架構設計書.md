@@ -51,7 +51,7 @@
 │  ordspd (選項定義) ─── ordspe (可選項目) ─── ordqty (部件用量)         │
 │                                      │                                  │
 │                                      ▼                                  │
-│                            ordqdt (報價規格快照)                        │
+│                            ordqdt_ai (報價規格快照)                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -87,12 +87,12 @@ ai_quote_assistant/
 ├── engine/                       # 商業邏輯與計價引擎（非 AI 計算）
 │   ├── __init__.py
 │   ├── calculator.py             # 成本／售價計算公式
-│   └── snapshot.py               # 生成 ordqdt 快照邏輯
+│   └── snapshot.py               # 生成 ordqdt_ai 快照邏輯
 │
 ├── database/                     # 資料庫存取層（ORM / SQL）
 │   ├── __init__.py
 │   ├── connection.py             # SQLAlchemy 資料庫連線管理
-│   ├── models.py                 # ordspd、ordspe、ordqty、ordqdt 模型
+│   ├── models.py                 # ordspd、ordspe、ordqty、ordqdt_ai 模型
 │   └── repository.py             # 查詢產品、部件、代碼對映之 SQL 實作
 │
 └── utils/                        # 輔助工具
@@ -206,7 +206,7 @@ $$
 
 #### 快照複製
 
-確認正式報價後，將當時的主檔數據完整寫入 `ordqdt`。
+確認正式報價後，將當時的主檔數據完整寫入 `ordqdt_ai`。
 
 主要包含：
 
@@ -235,7 +235,7 @@ $$
 | `ordspd` | 選項定義 |
 | `ordspe` | 可選項目 |
 | `ordqty` | 部件用量 |
-| `ordqdt` | 報價規格快照 |
+| `ordqdt_ai` | 報價規格快照 |
 
 主要 Repository 功能包括：
 
@@ -278,7 +278,7 @@ CHECKING
                                           │
                                           │ 建立快照
                                           ▼
-                                   ORDQDT SNAPSHOT
+                                   ordqdt_ai SNAPSHOT
 ```
 
 ### 建議狀態定義
@@ -291,7 +291,7 @@ CHECKING
 | `WAITING_FOR_INPUT` | 等待使用者補充資訊 |
 | `PREVIEW` | 報價草稿已建立，可試算 |
 | `CONFIRMED` | 使用者已確認正式報價 |
-| `SNAPSHOT_CREATED` | 已成功建立 `ordqdt` 快照 |
+| `SNAPSHOT_CREATED` | 已成功建立 `ordqdt_ai` 快照 |
 
 ---
 
@@ -414,7 +414,7 @@ with right_col:
 
         # 正式建立報價
         if st.button(
-            "確認建立正式報價單（寫入 ordqdt）",
+            "確認建立正式報價單（寫入 ordqdt_ai）",
             type="primary"
         ):
 
@@ -479,7 +479,7 @@ with right_col:
                       │
                       ▼
               ┌───────────────┐
-              │ ordqdt Snapshot│
+              │ ordqdt_ai Snapshot│
               └───────────────┘
 ```
 
@@ -609,7 +609,7 @@ AI Agent 僅負責：
 
 ### 8.2 報價必須具備可追溯性
 
-正式報價建立後，應將當下所使用的資料完整保存至 `ordqdt`。
+正式報價建立後，應將當下所使用的資料完整保存至 `ordqdt_ai`。
 
 如此可以確保：
 
@@ -728,7 +728,7 @@ Phase 5
 │
 ├── 建立報價 Preview
 ├── 使用者確認
-└── 建立 ordqdt Snapshot
+└── 建立 ordqdt_ai Snapshot
         │
         ▼
 Phase 6
@@ -768,7 +768,7 @@ AI Agent
       User Confirm
           │
           ▼
-      ordqdt Snapshot
+      ordqdt_ai Snapshot
 ```
 
 透過上述分層設計，可以在維持本機部署簡單性的同時，保留未來擴充至 FastAPI、Web API、權限管理、報價版本管理及企業級部署的彈性。

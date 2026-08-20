@@ -164,7 +164,7 @@ def preview_quote(quote_draft: dict) -> dict:
 
 def create_quote(quote_draft: dict, user: str = "SYS") -> dict:
     """
-    使用者確認後建立正式報價（寫入 ordqdt 快照）。
+    使用者確認後建立正式報價（寫入 ordqdt_ai 快照）。
     只有在使用者明確確認後才呼叫此函式。
 
     Args:

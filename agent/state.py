@@ -38,7 +38,7 @@ class QuoteStatus(str, Enum):
     PREVIEW = "PREVIEW"                  # 報價草稿試算完成，等待確認
     CONFIRMED = "CONFIRMED"              # 使用者已確認報價
     CREATING = "CREATING"                # 正在建立報價快照
-    SNAPSHOT_CREATED = "SNAPSHOT_CREATED"  # 已成功寫入 ordqdt
+    SNAPSHOT_CREATED = "SNAPSHOT_CREATED"  # 已成功寫入 ordqdt_ai
     COMPLETED = "COMPLETED"              # 完成
     ERROR = "ERROR"                      # 發生錯誤
 

@@ -61,7 +61,7 @@
 7. 依 `ordqty` 等資料計算部件需求量
 8. 呼叫報價引擎計算成本與售價
 9. 顯示報價預覽
-10. 使用者確認後產生正式報價（寫入 `ordqdt` 快照）
+10. 使用者確認後產生正式報價（寫入 `ordqdt_ai` 快照）
 11. 未來可由報價單轉成正式訂單
 
 **核心原則：AI 負責理解需求、查詢資料、提出選項與確認；正式的產品組合、用量、價格與報價金額由程式與報價引擎決定，不由 LLM 自行猜測。**
@@ -73,7 +73,7 @@
 - **AI 與計價邏輯完全分離**：LLM 不得自行計算任何金額，所有價格由 [`engine/calculator.py`](engine/calculator.py) 依資料庫正式資料計算。
 - **AI 不直接操作資料庫**：透過受控的 Business API / Tool 存取資料，可控制權限、商業規則與稽核。
 - **自然語言轉正式代碼**：例如「白色 / 美耐板 / 木腳 / 1200x600」會經由 `search_option()` 查詢對映為正式代碼，避免直接把文字寫入報價。
-- **報價快照可追溯**：正式報價建立時將當下成本、用量、規格寫入 `ordqdt`，即使日後主檔異動，歷史報價金額與規格仍維持原始內容。
+- **報價快照可追溯**：正式報價建立時將當下成本、用量、規格寫入 `ordqdt_ai`，即使日後主檔異動，歷史報價金額與規格仍維持原始內容。
 - **雙區介面**：左側對話互動區（Chat UI）、右側結構化報價試算卡片（Preview）。
 - **可擴充**：本機單機版起步，後續可 API 化（FastAPI）、加入權限管理、版本管理與文件輸入。
 
@@ -107,7 +107,7 @@
       ordspd (選項定義) ─ ordspe (可選項目) ─ ordqty (部件用量)
                             │
                             ▼
-                  ordqdt (報價規格快照)
+                  ordqdt_ai (報價規格快照)
 ```
 
 ### 架構分層
@@ -159,12 +159,12 @@ ai_quote_assistant/
 ├── engine/                       # 商業邏輯與計價引擎（非 AI 計算）
 │   ├── __init__.py
 │   ├── calculator.py             # 成本／售價計算公式
-│   └── snapshot.py               # 生成 ordqdt 快照邏輯
+│   └── snapshot.py               # 生成 ordqdt_ai 快照邏輯
 │
 ├── database/                     # 資料庫存取層（ORM / SQL）
 │   ├── __init__.py
 │   ├── connection.py             # SQLAlchemy 資料庫連線管理
-│   ├── models.py                 # ordspd、ordspe、ordqty、ordqdt 模型
+│   ├── models.py                 # ordspd、ordspe、ordqty、ordqdt_ai 模型
 │   └── repository.py             # 查詢產品、部件、代碼對映之 SQL 實作
 │
 └── utils/                        # 輔助工具
@@ -181,22 +181,22 @@ ai_quote_assistant/
 | `ordspd` | 選項定義檔 | 定義「有哪些選項類別」 |
 | `ordspe` | 可選項目檔 | 定義「某選項底下有哪些項目、採購成本」 |
 | `ordqty` | 產品部位用量檔 | 定義「某項目／部位需要多少用量」 |
-| `ordqdt` | 報價規格明細檔（建議新增） | 記錄「本次報價實際選了什麼」（歷史快照） |
+| `ordqdt_ai` | 報價規格明細檔（建議新增） | 記錄「本次報價實際選了什麼」（歷史快照） |
 
 資料流：
 
 ```text
 ordspd (選項定義) ─┐
-                   ├─→ ordqty (部件用量規則) ─→ ordqdt (報價選擇快照) ─→ 報價/訂單
+                   ├─→ ordqty (部件用量規則) ─→ ordqdt_ai (報價選擇快照) ─→ 報價/訂單
 ordspe (可選項目) ─┘
 ```
 
 ### 關鍵設計：主檔 vs. 快照
 
 - `ordspe.compri` = **目前主檔採購成本**
-- `ordqdt.compri` = **建立該報價當時的成本快照**
+- `ordqdt_ai.compri` = **建立該報價當時的成本快照**
 
-正式報價確認後，成本／用量／規格／單價／金額都完整保存於 `ordqdt`，避免主檔異動影響歷史報價。
+正式報價確認後，成本／用量／規格／單價／金額都完整保存於 `ordqdt_ai`，避免主檔異動影響歷史報價。
 
 > 詳細欄位定義、Primary Key、索引與 SQL 範例請參考 [`docs/報價訂單資料庫結構與關聯設計.md`](docs/報價訂單資料庫結構與關聯設計.md)。
 
@@ -220,7 +220,7 @@ PREVIEW（報價草稿試算）
 CONFIRMED
  │ 建立快照
  ▼
-SNAPSHOT_CREATED（寫入 ordqdt）
+SNAPSHOT_CREATED（寫入 ordqdt_ai）
 ```
 
 | 狀態 | 說明 |
@@ -231,7 +231,7 @@ SNAPSHOT_CREATED（寫入 ordqdt）
 | `WAITING_FOR_INPUT` | 等待使用者補充資訊 |
 | `PREVIEW` | 報價草稿已建立，可試算 |
 | `CONFIRMED` | 使用者已確認正式報價 |
-| `SNAPSHOT_CREATED` | 已成功建立 `ordqdt` 快照 |
+| `SNAPSHOT_CREATED` | 已成功建立 `ordqdt_ai` 快照 |
 
 ### AI Agent Tools（第一版）
 
@@ -342,7 +342,7 @@ streamlit run app.py
 
 啟動時系統自動：
 1. 建立 `dev.db`（SQLite 本機資料庫）
-2. 建立四張資料表（`ordspd` / `ordspe` / `ordqty` / `ordqdt`）
+2. 建立四張資料表（`ordspd` / `ordspe` / `ordqty` / `ordqdt_ai`）
 3. 灌入辦公桌範例假資料
 
 ### 切換至 MSSQL（正式 ERP）
@@ -403,7 +403,7 @@ ODBC Driver 17 for SQL Server
 ## 設計原則
 
 1. **AI 與計價邏輯分離**：AI 不自行判斷成本／售價，Prompt 中不硬編碼價格。
-2. **報價必須具備可追溯性**：正式報價建立後寫入 `ordqdt` 快照，歷史報價不受主檔異動影響。
+2. **報價必須具備可追溯性**：正式報價建立後寫入 `ordqdt_ai` 快照，歷史報價不受主檔異動影響。
 3. **UI / Agent / Engine / Database 解耦**：方便未來替換前端或 API 化。
 4. **AI 不直接執行 SQL**：透過受控 Tool / API 存取，確保權限與稽核。
 5. **報價與訂單分開**：報價確認後才轉為訂單，不將報價資料直接當作訂單資料。
@@ -432,7 +432,7 @@ ODBC Driver 17 for SQL Server
 
 ```text
 Streamlit UI → database/ 查詢 → Agent 與 Tool Calling
-→ calculator.py 計價 → 報價 Preview 與 ordqdt Snapshot
+→ calculator.py 計價 → 報價 Preview 與 ordqdt_ai Snapshot
 → 稽核日誌 / 報價輸出 / 權限與版本管理
 ```
 

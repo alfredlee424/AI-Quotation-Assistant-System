@@ -3,7 +3,7 @@ engine/snapshot.py - 報價快照組裝與 ref_no 產生
 
 職責：
   1. 產生唯一報價單號（ref_no），格式：Q{YYYYMMDD}{4碼序號}
-  2. 將計算結果（CalcResult）與報價草稿組裝成 ordqdt 明細清單
+  2. 將計算結果（CalcResult）與報價草稿組裝成 ordqdt_ai 明細清單
   3. 呼叫 repository.save_quote_snapshot() 寫入資料庫
 
 設計原則：
@@ -43,15 +43,15 @@ def generate_ref_no(workgroup: str = WORKGROUP) -> str:
 def _count_today_quotes(prefix: str, workgroup: str) -> int:
     """查詢今日已使用的報價單號數量（避免流水號衝突）"""
     from database.connection import get_db
-    from database.models import Ordqdt
+    from database.models import ordqdt_ai
     db = get_db()
     try:
         # 取得不重複的 ref_no 數量
         count = (
-            db.query(Ordqdt.ref_no)
+            db.query(ordqdt_ai.ref_no)
             .filter(
-                Ordqdt.workgroup == workgroup,
-                Ordqdt.ref_no.like(f"{prefix}%"),
+                ordqdt_ai.workgroup == workgroup,
+                ordqdt_ai.ref_no.like(f"{prefix}%"),
             )
             .distinct()
             .count()
@@ -62,7 +62,7 @@ def _count_today_quotes(prefix: str, workgroup: str) -> int:
 
 
 # ============================================================
-# 組裝 ordqdt 快照資料
+# 組裝 ordqdt_ai 快照資料
 # ============================================================
 
 def build_snapshot_items(
@@ -73,7 +73,7 @@ def build_snapshot_items(
     workgroup: str = WORKGROUP,
 ) -> list[dict]:
     """
-    將計算結果（CalcResult.items）組裝為可寫入 ordqdt 的明細清單。
+    將計算結果（CalcResult.items）組裝為可寫入 ordqdt_ai 的明細清單。
 
     Args:
         calc_result  : 計算引擎回傳的 CalcResult
@@ -137,7 +137,7 @@ def create_quote_snapshot(
     workgroup: str = WORKGROUP,
 ) -> str:
     """
-    產生報價單號、組裝快照資料、寫入 ordqdt。
+    產生報價單號、組裝快照資料、寫入 ordqdt_ai。
 
     Args:
         calc_result : 計算引擎回傳的 CalcResult

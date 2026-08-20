@@ -81,7 +81,7 @@ def calc_items_to_df(items: list[dict]) -> pd.DataFrame:
 
 def snapshot_to_df(snapshot_items: list[dict]) -> pd.DataFrame:
     """
-    將 ordqdt 快照明細轉成 DataFrame。
+    將 ordqdt_ai 快照明細轉成 DataFrame。
 
     Args:
         snapshot_items: repository.get_quote_snapshot() 回傳的清單

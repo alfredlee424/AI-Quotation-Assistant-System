@@ -5,7 +5,7 @@ database/models.py - ORM 資料模型定義
   - Ordspd  : 選項定義檔
   - Ordspe  : 可選項目檔（含採購單價）
   - Ordqty  : 產品部位用量檔（BOM 用量規則）
-  - Ordqdt  : 報價規格明細檔（快照，建議新增）
+  - ordqdt_ai  : 報價規格明細檔（快照，建議新增）
 
 主要設計原則：
   - 使用 SQLAlchemy 2.x Mapped 型別標註
@@ -130,17 +130,17 @@ class Ordqty(Base):
 
 
 # ============================================================
-# ordqdt — 報價規格明細檔（快照，建議新增）
+# ordqdt_ai — 報價規格明細檔（快照，建議新增）
 # PK: (workgroup, ref_no, seq_no)
 # ============================================================
 
-class Ordqdt(Base):
+class ordqdt_ai(Base):
     """
     報價規格明細檔（報價快照）。
     保存「本次報價建立當下」所選規格、成本、售價，
     確保歷史報價不受主檔異動影響。
     """
-    __tablename__ = "ordqdt"
+    __tablename__ = "ordqdt_ai"
 
     # --- PK ---
     workgroup: Mapped[str] = mapped_column(String(3), primary_key=True, comment="事業別")
@@ -169,6 +169,7 @@ class Ordqdt(Base):
 
     # --- 狀態 ---
     status: Mapped[Optional[str]] = mapped_column(String(1), nullable=True, comment="狀態（D草稿/C確認/X作廢）")
+    transferred: Mapped[Optional[str]] = mapped_column(String(1), nullable=True, default="N", comment="是否已轉入正式報價（Y已轉入/N未轉入），預設 N")
 
     # --- 稽核欄位 ---
     adddate: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="建立日期")
@@ -179,12 +180,12 @@ class Ordqdt(Base):
     prgno: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="異動程式")
 
     __table_args__ = (
-        UniqueConstraint("workgroup", "ref_no", "seq_no", name="uq_ordqdt_pk"),
+        UniqueConstraint("workgroup", "ref_no", "seq_no", name="uq_ordqdt_ai_pk"),
     )
 
     def __repr__(self) -> str:
         return (
-            f"<Ordqdt ref_no={self.ref_no!r} seq_no={self.seq_no!r} "
+            f"<ordqdt_ai ref_no={self.ref_no!r} seq_no={self.seq_no!r} "
             f"part={self.part_code!r} amount={self.amount}>"
         )
 
