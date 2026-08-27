@@ -20,6 +20,7 @@ from database.seed_data import seed
 from utils.helpers import (
     calc_items_to_df,
     quote_draft_summary,
+    quote_selections_list,
     get_status_badge,
     fmt_money,
 )
@@ -77,16 +78,13 @@ st.markdown(
         <h2 style='margin:0'>🤖 AI 產品報價助理</h2>
         <p style='color:#888; font-size:0.85rem; margin:0'>
             自然語言報價系統 &nbsp;|&nbsp;
-            資料庫：{'SQLite（開發）' if IS_SQLITE else 'MSSQL（正式）'} &nbsp;|&nbsp;
-            AI 模式：{'LLM（' + OPENAI_MODEL + '）' if USE_LLM else '規則式'}
+            資料庫：{db_mode} &nbsp;|&nbsp;
+            AI 模式：{ai_mode}
         </p>
     </div>
-    """.replace(
-        "{'SQLite（開發）' if IS_SQLITE else 'MSSQL（正式）'}",
-        "SQLite（開發）" if IS_SQLITE else "MSSQL（正式）",
-    ).replace(
-        "{'LLM（' + OPENAI_MODEL + '）' if USE_LLM else '規則式'}",
-        f"LLM（{OPENAI_MODEL}）" if USE_LLM else "規則式",
+    """.format(
+        db_mode="SQLite（開發）" if IS_SQLITE else "MSSQL（正式）",
+        ai_mode=f"LLM（{OPENAI_MODEL}）" if USE_LLM else "規則式",
     ),
     unsafe_allow_html=True,
 )
@@ -114,7 +112,7 @@ with left_col:
             st.markdown(
                 "👋 **歡迎使用 AI 報價助理！**\n\n"
                 "請直接描述您的需求，例如：\n\n"
-                "> 我要 20 張 1200×600 的桌子，美耐板白色，木腳。\n\n"
+                "> 我要 20 張 60*120 的桌子，美耐板白色，木腳。\n\n"
                 "系統將自動解析並為您試算報價。"
             )
 
@@ -123,7 +121,7 @@ with left_col:
                 st.markdown(msg["content"])
 
     # 使用者輸入
-    if prompt := st.chat_input("請輸入需求，例如：20張 1200x600 美耐板白色木腳桌子…"):
+    if prompt := st.chat_input("請輸入需求，例如：20張 60*120 美耐板白色木腳桌子…"):
         # 記錄輸入
         log_user_input(prompt)
 
@@ -171,7 +169,7 @@ with left_col:
             st.rerun()
     with btn_cols[2]:
         if st.button("📋 範例需求", use_container_width=True):
-            prompt = "我要 20 張 1200x600 的桌子，美耐板白色，木腳"
+            prompt = "我要 20 張 60*120 的桌子，美耐板白色，木腳"
             st.session_state.messages.append({"role": "user", "content": prompt})
             response, updated_quote = run_quote_agent(
                 user_input=prompt,
@@ -212,20 +210,46 @@ with right_col:
             st.rerun()
         st.stop()
 
-    # ── 規格摘要卡片 ──────────────────────────────────────
-    summary = quote_draft_summary(quote_data)
+    # ── 規格摘要卡片（動態渲染 selections） ───────────────
     with st.container(border=True):
         col1, col2 = st.columns(2)
+
+        # 固定欄位
         with col1:
-            st.markdown(f"**產品：** {summary['產品']}")
-            st.markdown(f"**數量：** {summary['數量']}")
-            st.markdown(f"**桌面尺寸：** {summary['桌面尺寸']}")
-            st.markdown(f"**桌面材質：** {summary['桌面材質']}")
+            st.markdown(f"**產品：** {quote_data.get('product_name', '辦公桌')}")
+            qty_display = f"{quote_data.get('qty')} 張" if quote_data.get("qty") else "--"
+            st.markdown(f"**數量：** {qty_display}")
+
+        # 動態列出已選選項（依 selections 的 optdesc）
+        sel_list = quote_selections_list(quote_data)
+        half = max(len(sel_list) // 2, 1)
+        left_sels = sel_list[:half]
+        right_sels = sel_list[half:]
+
+        with col1:
+            for sel in left_sels:
+                label = sel["optdesc"]
+                codsc = sel["codsc"]
+                compri = sel["compri"]
+                if compri and compri > 0:
+                    st.markdown(f"**{label}：** {codsc}（${compri:,.0f}）")
+                else:
+                    st.markdown(f"**{label}：** {codsc}")
+
         with col2:
-            st.markdown(f"**顏色：** {summary['顏色']}")
-            st.markdown(f"**腳架：** {summary['腳架']}")
-            if summary['建議售價'] != "--":
-                st.markdown(f"**建議售價：** {summary['建議售價']}")
+            for sel in right_sels:
+                label = sel["optdesc"]
+                codsc = sel["codsc"]
+                compri = sel["compri"]
+                if compri and compri > 0:
+                    st.markdown(f"**{label}：** {codsc}（${compri:,.0f}）")
+                else:
+                    st.markdown(f"**{label}：** {codsc}")
+
+            # 建議售價顯示在右欄
+            calc = quote_data.get("calc_result", {}) or {}
+            if calc.get("total_price"):
+                st.markdown(f"**建議售價：** {fmt_money(calc.get('total_price'))}")
 
     # ── 缺少欄位提示 ─────────────────────────────────────
     missing = quote_data.get("missing_fields", [])

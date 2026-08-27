@@ -10,28 +10,24 @@ engine/calculator.py - 報價計算引擎
     折扣後售價 = 加成後售價 × (1 - discount_rate)
     含稅金額   = 折扣後售價 × (1 + TAX_RATE)
 
-資料結構：
-    QuoteItem（計算用）：
-        part_code   : str    部件代碼
-        part_desc   : str    部件名稱
-        path        : str    選配路徑
-        spc_code    : str    規格代碼
-        spdsc       : str    規格說明
-        qty         : float  數量
-        stdqty      : float  標準用量
-        stdpar      : float  裁切量
-        compri      : float  採購成本（由 repository 取得）
+selections 格式（optno 驅動，對齊真實資料庫）：
+    quote_draft["selections"] = {
+        "A001": {
+            "optno": "A001",
+            "optdesc": "桌面尺寸",
+            "path": "CMT1\\A001",
+            "code": "C001",
+            "codsc": "60*120",
+            "compri": 0.0,
+        },
+        "S002": {...},  # 材質
+        "B001": {...},  # 木腳
+        ...
+    }
 
-    CalcResult（計算結果）：
-        items           : list[dict]  各明細成本、單價、金額
-        total_cost      : float       材料總成本
-        total_price     : float       含稅最終報價
-        subtotal        : float       加成後小計
-        discount_amount : float       折扣金額
-        tax_amount      : float       稅額
-        markup_rate     : float       加成率
-        discount_rate   : float       折扣率
-        tax_rate        : float       稅率
+路徑格式說明：
+    ordspe.path = {PRODUCT_PREFIX}\\{optno}  （如 CMT1\\A001）
+    查詢只用 (workgroup, path, code)，不用 codsc（真實 ordqty.codsc 全為 NULL）
 """
 
 from __future__ import annotations
@@ -50,16 +46,17 @@ from database import repository as repo
 @dataclass
 class QuoteItem:
     """計算用報價明細項目（由 Agent 組裝後傳入計算引擎）"""
-    part_code: str
-    part_desc: str
-    path: str
-    spc_code: str
-    spdsc: str
-    qty: float
-    stdqty: float
-    stdpar: float
-    compri: float          # 採購成本（由 repository 即時取得）
-    codsc: str = ""        # ordspe.codsc（對映 ordqty 用）
+    part_code: str        # 項目代號（ordspe.code）
+    part_desc: str        # 項目名稱（ordspe.codsc）
+    path: str             # 選配路徑（ordspe.path，如 CMT1\\S002）
+    spc_code: str         # 規格代號（同 code）
+    spdsc: str            # 規格說明（同 codsc）
+    qty: float            # 數量（使用者訂購數量）
+    stdqty: float         # 標準用量（ordqty.stdqty）
+    stdpar: float         # 裁切量（ordqty.stdpar）
+    compri: float         # 採購成本（由 repository 即時取得）
+    optno: str = ""       # 選項類別代碼（ordspd.optno，如 A001）
+    optdesc: str = ""     # 選項類別說明（ordspd.optdesc，如 桌面尺寸）
 
     @property
     def part_cost(self) -> float:
@@ -121,6 +118,8 @@ def calculate_quote(
         amount = unit_price * item.qty
 
         result_items.append({
+            "optno": item.optno,
+            "optdesc": item.optdesc,
             "part_code": item.part_code,
             "part_desc": item.part_desc,
             "path": item.path,
@@ -167,15 +166,29 @@ def calculate_from_draft(quote_draft: dict) -> CalcResult:
     """
     從報價草稿（agent 維護的 current_quote dict）計算報價。
 
-    quote_draft 格式：
+    quote_draft 格式（optno 驅動）：
     {
         "product_name": "辦公桌",
         "qty": 20,
         "selections": {
-            "size":     {"path": "DESK\\SIZE", "code": "S1200600", "codsc": "1200×600mm"},
-            "material": {"path": "DESK\\MATS", "code": "CLMT",     "codsc": "美耐板"},
-            "color":    {"path": "DESK\\COLOR","code": "WHITE",     "codsc": "白色"},
-            "leg":      {"path": "DESK\\LEG",  "code": "WLEG",      "codsc": "木腳"},
+            "A001": {
+                "optno": "A001",
+                "optdesc": "桌面尺寸",
+                "path": "CMT1\\A001",
+                "code": "C001",
+                "codsc": "60*120",
+                "compri": 0.0,
+            },
+            "S002": {
+                "optno": "S002",
+                "optdesc": "材質",
+                "path": "CMT1\\S002",
+                "code": "C001",
+                "codsc": "美耐板",
+                "compri": 500.0,
+            },
+            "B001": {...},   # 木腳
+            "W030": {...},   # 木工費
         },
         "discount_rate": 0.0,
     }
@@ -186,21 +199,22 @@ def calculate_from_draft(quote_draft: dict) -> CalcResult:
 
     items: list[QuoteItem] = []
 
-    for sel_key, sel in selections.items():
+    for optno, sel in selections.items():
         path = sel.get("path", "")
         code = sel.get("code", "")
         codsc = sel.get("codsc", "")
+        optdesc = sel.get("optdesc", "")
 
-        # 取得用量規則
-        qty_rule = repo.get_part_quantity(path=path, code=code, codsc=codsc)
+        # 取得用量規則（不傳 codsc，因真實 ordqty.codsc 全為 NULL）
+        qty_rule = repo.get_part_quantity(path=path, code=code)
         stdqty = qty_rule["stdqty"] if qty_rule else 1.0
         stdpar = qty_rule["stdpar"] if qty_rule else 1.0
 
         # 取得最新採購成本（快照前的主檔值）
-        compri = repo.get_option_price(path=path, code=code, codsc=codsc)
+        compri = repo.get_option_price(path=path, code=code)
 
-        # 顏色等 compri=0 的選項不計入成本
-        if compri == 0.0 and sel_key == "color":
+        # compri = 0 時略過此項（無成本的選項，如標準顏色）
+        if compri == 0.0:
             continue
 
         items.append(QuoteItem(
@@ -213,31 +227,8 @@ def calculate_from_draft(quote_draft: dict) -> CalcResult:
             stdqty=stdqty,
             stdpar=stdpar,
             compri=compri,
-            codsc=codsc,
-        ))
-
-    # 加入共用部件（橫樑、螺絲）
-    common_parts = [
-        {"path": "DESK\\PARTS", "code": "BEAM",  "codsc": "橫樑"},
-        {"path": "DESK\\PARTS", "code": "SCREW", "codsc": "螺絲組"},
-    ]
-    for cp in common_parts:
-        qty_rule = repo.get_part_quantity(**cp)
-        compri = repo.get_option_price(**cp)
-        if compri == 0.0:
-            continue
-        stdqty = qty_rule["stdqty"] if qty_rule else 1.0
-        stdpar = qty_rule["stdpar"] if qty_rule else 1.0
-        items.append(QuoteItem(
-            part_code=cp["code"],
-            part_desc=cp["codsc"],
-            path=cp["path"],
-            spc_code=cp["code"],
-            spdsc=cp["codsc"],
-            qty=qty,
-            stdqty=stdqty,
-            stdpar=stdpar,
-            compri=compri,
+            optno=optno,
+            optdesc=optdesc,
         ))
 
     return calculate_quote(items, discount_rate=discount_rate)

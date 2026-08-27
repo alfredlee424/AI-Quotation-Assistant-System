@@ -3,14 +3,23 @@ agent/rule_parser.py - 規則式自然語言解析器
 
 無需 LLM API 即可從使用者輸入中擷取：
   - 數量（20張、100張、20個）
-  - 桌面尺寸（1200x600、1500×600）
-  - 桌面材質（美耐板、實木、玻璃）
-  - 顏色（白色、黑色、米色、胡桃）
-  - 腳架類型（木腳、金屬腳、鋼管）
+  - 桌面尺寸（60*120、75*180、120x75）
+  - 材質關鍵字（美耐板、實木、玻璃）→ 查詢對應 optno=S002
+  - 腳架關鍵字（木腳、鐵腳）→ 查詢對應 optno=B001/B002
+  - 顏色關鍵字（白色、黑色、胡桃）→ 查詢對應 optno=S005
   - 確認意圖（是、確認、建立、OK）
   - 取消意圖（否、取消、不要）
 
-並查詢資料庫將關鍵字轉成正式代碼。
+並查詢資料庫將關鍵字轉成正式代碼（optno 驅動）。
+
+selections 格式（以 optno 為 key）：
+    {
+        "A001": {"optno": "A001", "optdesc": "桌面尺寸",
+                 "path": "CMT1\\A001", "code": "C001", "codsc": "60*120", "compri": 0.0},
+        "S002": {"optno": "S002", "optdesc": "材質",
+                 "path": "CMT1\\S002", "code": "C001", "codsc": "美耐板", "compri": 500.0},
+        ...
+    }
 """
 
 from __future__ import annotations
@@ -19,14 +28,14 @@ import re
 from typing import Optional
 
 from database import repository as repo
-from config import WORKGROUP
+from config import WORKGROUP, PRODUCT_PREFIX
 
 
 # ============================================================
 # 關鍵字對映表（自然語言 → 資料庫搜尋關鍵字）
 # ============================================================
 
-# 材質對映
+# 材質關鍵字（搜尋 ordspe，path 含 optno=S002）
 MATERIAL_KEYWORDS: dict[str, str] = {
     "美耐板": "美耐板",
     "美耐": "美耐板",
@@ -40,7 +49,7 @@ MATERIAL_KEYWORDS: dict[str, str] = {
     "塑合板": "密集板",
 }
 
-# 顏色對映
+# 顏色關鍵字（搜尋 ordspe，path 含 optno=S005）
 COLOR_KEYWORDS: dict[str, str] = {
     "白色": "白色",
     "白": "白色",
@@ -55,19 +64,15 @@ COLOR_KEYWORDS: dict[str, str] = {
     "木色": "胡桃木色",
 }
 
-# 腳架對映
+# 腳架關鍵字（搜尋 ordspe，path 含 optno=B001/B002）
 LEG_KEYWORDS: dict[str, str] = {
     "木腳": "木腳",
     "木製腳": "木腳",
     "實木腳": "木腳",
-    "金屬腳": "金屬腳",
-    "金屬": "金屬腳",
-    "鐵腳": "金屬腳",
+    "鐵腳": "鐵腳",
+    "金屬腳": "鐵腳",
     "鋼管腳": "鋼管腳",
     "鋼管": "鋼管腳",
-    "U型腳": "U型腳",
-    "U形腳": "U型腳",
-    "u腳": "U型腳",
 }
 
 # 確認意圖關鍵字
@@ -94,16 +99,70 @@ def extract_quantity(text: str) -> Optional[int]:
     Returns:
         int 數量，或 None（若無法識別）
     """
-    # 匹配「數字 + 量詞」如「20張」「100個」「50件」「20套」
     m = re.search(r"(\d+)\s*[張個件套台]", text)
     if m:
         return int(m.group(1))
-
-    # 純數字（例如使用者說「20」）
     m = re.search(r"(\d+)", text)
     if m:
         return int(m.group(1))
+    return None
 
+
+# ============================================================
+# 通用選項查詢（依關鍵字 + optno 過濾）
+# ============================================================
+
+def _lookup_option_by_optno(keyword: str, optno: str) -> Optional[dict]:
+    """
+    查詢 ordspe 中符合關鍵字且屬於指定 optno 的選項。
+    path 格式為 {PRODUCT_PREFIX}\\{optno}，如 CMT1\\S002。
+
+    Returns:
+        dict {optno, optdesc, path, code, codsc, compri} 或 None
+    """
+    target_path = repo.build_option_path(optno)
+    results = repo.search_option(keyword=keyword, workgroup=WORKGROUP)
+    filtered = [r for r in results if r.get("path", "") == target_path]
+    if filtered:
+        r = filtered[0]
+        # 取得 optdesc
+        cats = repo.get_all_option_categories()
+        cat_map = {c["optno"]: c["optdesc"] for c in cats}
+        return {
+            "optno": optno,
+            "optdesc": cat_map.get(optno, optno),
+            "path": r["path"],
+            "code": r["code"],
+            "codsc": r["codsc"],
+            "compri": r["compri"],
+        }
+    return None
+
+
+def _lookup_option_by_path_prefix(keyword: str, path_prefix: str) -> Optional[dict]:
+    """
+    查詢 ordspe 中符合關鍵字且 path 開頭符合 path_prefix 的選項。
+    用於 optno 有多個選擇的情況（如木腳可能是 B001 或 B002）。
+
+    Returns:
+        dict {optno, optdesc, path, code, codsc, compri} 或 None
+    """
+    results = repo.search_option(keyword=keyword, workgroup=WORKGROUP)
+    prefix = f"{PRODUCT_PREFIX}\\{path_prefix}" if not path_prefix.startswith(PRODUCT_PREFIX) else path_prefix
+    filtered = [r for r in results if r.get("path", "").startswith(prefix)]
+    if filtered:
+        r = filtered[0]
+        optno = r.get("optno", repo.optno_from_path(r["path"]))
+        cats = repo.get_all_option_categories()
+        cat_map = {c["optno"]: c["optdesc"] for c in cats}
+        return {
+            "optno": optno,
+            "optdesc": cat_map.get(optno, optno),
+            "path": r["path"],
+            "code": r["code"],
+            "codsc": r["codsc"],
+            "compri": r["compri"],
+        }
     return None
 
 
@@ -113,74 +172,75 @@ def extract_quantity(text: str) -> Optional[int]:
 
 def extract_size(text: str) -> Optional[dict]:
     """
-    從文字中擷取桌面尺寸，並查詢對應代碼。
-    支援：「1200x600」「1200×600」「1200*600」「1200X600」
+    從文字中擷取桌面尺寸，對應 ordspd.optno=A001。
+    支援：「60*120」「75×180」「1200x600」（自動換算 cm/mm 格式）
 
     Returns:
-        dict {path, code, codsc} 或 None
+        dict {optno, optdesc, path, code, codsc, compri} 或 None
     """
-    # 匹配 WxH 格式
-    m = re.search(r"(\d{3,4})\s*[xX×*]\s*(\d{3,4})", text)
+    # 匹配 WxH 格式（支援 cm 格式如 60*120 或 mm 格式如 1200x600）
+    m = re.search(r"(\d{2,4})\s*[xX×*]\s*(\d{2,4})", text)
     if not m:
         return None
 
-    w, h = m.group(1), m.group(2)
-    keyword = f"{w}×{h}"
+    w_raw, h_raw = m.group(1), m.group(2)
 
-    # 先嘗試精確搜尋，再模糊搜尋
-    results = repo.search_option(keyword=keyword, workgroup=WORKGROUP)
-    if not results:
-        results = repo.search_option(keyword=f"{w}", workgroup=WORKGROUP)
+    # mm 轉 cm（>= 100 認為是 mm）
+    w = int(w_raw) // 10 if int(w_raw) >= 100 else int(w_raw)
+    h = int(h_raw) // 10 if int(h_raw) >= 100 else int(h_raw)
 
-    # 過濾出尺寸路徑
-    size_results = [r for r in results if "SIZE" in r.get("path", "")]
-    if size_results:
-        r = size_results[0]
-        return {"path": r["path"], "code": r["code"], "codsc": r["codsc"]}
+    # 嘗試各種格式搜尋（如 60*120、75*180）
+    for kw in [f"{w}*{h}", f"{h}*{w}", str(w), str(h)]:
+        result = _lookup_option_by_optno(kw, "A001")
+        if result:
+            return result
 
     return None
 
 
 # ============================================================
-# 通用選項解析（材質、顏色、腳架）
+# 材質解析（optno=S002）
 # ============================================================
-
-def _lookup_option(keyword: str, path_filter: str) -> Optional[dict]:
-    """
-    查詢資料庫中符合關鍵字且路徑包含 path_filter 的選項。
-
-    Returns:
-        dict {path, code, codsc} 或 None
-    """
-    results = repo.search_option(keyword=keyword, workgroup=WORKGROUP)
-    filtered = [r for r in results if path_filter in r.get("path", "")]
-    if filtered:
-        r = filtered[0]
-        return {"path": r["path"], "code": r["code"], "codsc": r["codsc"]}
-    return None
-
 
 def extract_material(text: str) -> Optional[dict]:
-    """從文字擷取桌面材質並轉成正式代碼"""
+    """從文字擷取桌面材質（optno=S002）並查詢正式代碼"""
     for kw, search_kw in MATERIAL_KEYWORDS.items():
         if kw in text:
-            return _lookup_option(search_kw, "MATS")
+            result = _lookup_option_by_optno(search_kw, "S002")
+            if result:
+                return result
     return None
 
+
+# ============================================================
+# 顏色解析（optno=S005）
+# ============================================================
 
 def extract_color(text: str) -> Optional[dict]:
-    """從文字擷取顏色並轉成正式代碼"""
+    """從文字擷取顏色（optno=S005）並查詢正式代碼"""
     for kw, search_kw in COLOR_KEYWORDS.items():
         if kw in text:
-            return _lookup_option(search_kw, "COLOR")
+            result = _lookup_option_by_optno(search_kw, "S005")
+            if result:
+                return result
     return None
 
 
+# ============================================================
+# 腳架解析（optno=B001 木腳 / B002 鐵腳）
+# ============================================================
+
 def extract_leg(text: str) -> Optional[dict]:
-    """從文字擷取腳架類型並轉成正式代碼"""
+    """從文字擷取腳架類型（optno=B001 或 B002）並查詢正式代碼"""
     for kw, search_kw in LEG_KEYWORDS.items():
         if kw in text:
-            return _lookup_option(search_kw, "LEG")
+            # 先找 B001（木腳類），再找 B002（鐵腳類）
+            result = (
+                _lookup_option_by_optno(search_kw, "B001") or
+                _lookup_option_by_optno(search_kw, "B002")
+            )
+            if result:
+                return result
     return None
 
 
@@ -207,6 +267,7 @@ def is_cancel(text: str) -> bool:
 def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str]]:
     """
     解析使用者輸入，擷取所有可識別的欄位並更新報價草稿。
+    selections 以 optno 為 key。
 
     Args:
         user_input  : 使用者原始輸入
@@ -224,28 +285,28 @@ def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str
         quote_draft["qty"] = qty
         found.append(f"數量：{qty} 張")
 
-    # 尺寸
+    # 尺寸（A001）
     size = extract_size(user_input)
     if size:
-        quote_draft.setdefault("selections", {})["size"] = size
+        quote_draft.setdefault("selections", {})[size["optno"]] = size
         found.append(f"桌面尺寸：{size['codsc']}")
 
-    # 材質
+    # 材質（S002）
     material = extract_material(user_input)
     if material:
-        quote_draft.setdefault("selections", {})["material"] = material
-        found.append(f"桌面材質：{material['codsc']}")
+        quote_draft.setdefault("selections", {})[material["optno"]] = material
+        found.append(f"材質：{material['codsc']}")
 
-    # 顏色
+    # 顏色（S005）
     color = extract_color(user_input)
     if color:
-        quote_draft.setdefault("selections", {})["color"] = color
+        quote_draft.setdefault("selections", {})[color["optno"]] = color
         found.append(f"顏色：{color['codsc']}")
 
-    # 腳架
+    # 腳架（B001 / B002）
     leg = extract_leg(user_input)
     if leg:
-        quote_draft.setdefault("selections", {})["leg"] = leg
+        quote_draft.setdefault("selections", {})[leg["optno"]] = leg
         found.append(f"腳架：{leg['codsc']}")
 
     return quote_draft, found
@@ -267,14 +328,11 @@ def format_missing_prompt(missing_fields: list[str], current_draft: dict) -> str
 
     if current_draft.get("qty"):
         confirmed.append(f"數量：{current_draft['qty']} 張")
-    if "size" in selections:
-        confirmed.append(f"尺寸：{selections['size']['codsc']}")
-    if "material" in selections:
-        confirmed.append(f"材質：{selections['material']['codsc']}")
-    if "color" in selections:
-        confirmed.append(f"顏色：{selections['color']['codsc']}")
-    if "leg" in selections:
-        confirmed.append(f"腳架：{selections['leg']['codsc']}")
+
+    for optno, sel in selections.items():
+        optdesc = sel.get("optdesc", optno)
+        codsc = sel.get("codsc", "")
+        confirmed.append(f"{optdesc}：{codsc}")
 
     lines: list[str] = []
 

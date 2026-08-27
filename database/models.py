@@ -100,14 +100,18 @@ class Ordqty(Base):
     """
     產品部位用量檔。
     描述產品部位與其標準用量、裁切量，是 BOM 的核心。
+
+    注意：真實 MSSQL 資料庫中 codsc 欄位全部為 NULL，
+    因此 ORM 模型中 codsc 設為 nullable，不納入 PK，
+    查詢只依 (workgroup, path, code) 三欄比對。
     """
     __tablename__ = "ordqty"
 
-    # --- PK ---
+    # --- PK（僅三欄，codsc 在真實資料全為 NULL）---
     workgroup: Mapped[str] = mapped_column(String(3), primary_key=True, comment="事業別")
     path: Mapped[str] = mapped_column(String(100), primary_key=True, comment="項目階層路徑")
     code: Mapped[str] = mapped_column(String(10), primary_key=True, comment="項目代號")
-    codsc: Mapped[str] = mapped_column(String(40), primary_key=True, comment="項目名稱")
+    codsc: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, comment="項目名稱（真實資料全為 NULL）")
 
     # --- 資料欄位 ---
     part_path: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, comment="產品部位路徑")

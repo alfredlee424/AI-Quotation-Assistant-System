@@ -6,6 +6,7 @@ utils/helpers.py - 格式化輸出與數值轉換工具
   - 百分比格式化
   - 報價草稿 → 可顯示的 DataFrame
   - 狀態標籤取得
+  - 選項摘要動態列出（依 optdesc，不寫死四個欄位）
 """
 
 from __future__ import annotations
@@ -63,13 +64,13 @@ def calc_items_to_df(items: list[dict]) -> pd.DataFrame:
         pd.DataFrame 含中文欄位名稱
     """
     if not items:
-        return pd.DataFrame(columns=["部件", "規格", "數量", "標準用量", "採購成本", "單價", "金額"])
+        return pd.DataFrame(columns=["類別", "規格", "數量", "標準用量", "採購成本", "單價", "金額"])
 
     rows = []
     for item in items:
         rows.append({
-            "部件": item.get("part_desc", ""),
-            "規格": item.get("spdsc", ""),
+            "類別": item.get("optdesc") or item.get("part_desc", ""),
+            "規格": item.get("codsc") or item.get("spdsc", ""),
             "數量": fmt_qty(item.get("qty")),
             "標準用量": fmt_qty(item.get("stdqty")),
             "採購成本": fmt_money(item.get("compri")),
@@ -109,31 +110,63 @@ def snapshot_to_df(snapshot_items: list[dict]) -> pd.DataFrame:
 
 
 # ============================================================
-# 報價草稿摘要（用於右側卡片顯示）
+# 報價草稿摘要（動態依 selections 列出，不寫死四欄）
 # ============================================================
 
 def quote_draft_summary(quote_draft: dict) -> dict[str, str]:
     """
     從報價草稿擷取關鍵欄位，回傳可直接顯示的 dict。
+    selections 以 optno 為 key，動態列出所有已選項目。
 
     Returns:
-        dict {label: value}
+        dict {label: value}，固定欄位 + 動態選項
     """
     selections = quote_draft.get("selections", {})
     calc = quote_draft.get("calc_result", {}) or {}
 
-    return {
+    result: dict[str, str] = {
         "產品": quote_draft.get("product_name", "辦公桌"),
         "數量": f"{quote_draft.get('qty', '--')} 張" if quote_draft.get("qty") else "--",
-        "桌面尺寸": selections.get("size", {}).get("codsc", "--"),
-        "桌面材質": selections.get("material", {}).get("codsc", "--"),
-        "顏色": selections.get("color", {}).get("codsc", "--"),
-        "腳架": selections.get("leg", {}).get("codsc", "--"),
+    }
+
+    # 動態加入每個已選選項（依 optdesc 作為顯示標題）
+    for optno, sel in selections.items():
+        label = sel.get("optdesc") or optno
+        codsc = sel.get("codsc", "--")
+        compri = sel.get("compri", 0.0)
+        # compri > 0 時顯示成本提示
+        if compri and compri > 0:
+            result[label] = f"{codsc}（${compri:,.0f}）"
+        else:
+            result[label] = codsc
+
+    result.update({
         "材料成本": fmt_money(calc.get("total_cost")) if calc else "--",
         "建議售價": fmt_money(calc.get("total_price")) if calc else "--",
         "折扣率": fmt_percent(calc.get("discount_rate", 0)) if calc else "--",
         "含稅總額": fmt_money(calc.get("total_price")) if calc else "--",
-    }
+    })
+
+    return result
+
+
+def quote_selections_list(quote_draft: dict) -> list[dict]:
+    """
+    將 selections 整理為有序的清單，供 UI 逐行顯示。
+
+    Returns:
+        list[dict] 每筆含 optno, optdesc, codsc, compri
+    """
+    selections = quote_draft.get("selections", {})
+    return [
+        {
+            "optno": optno,
+            "optdesc": sel.get("optdesc", optno),
+            "codsc": sel.get("codsc", "--"),
+            "compri": sel.get("compri", 0.0),
+        }
+        for optno, sel in selections.items()
+    ]
 
 
 # ============================================================

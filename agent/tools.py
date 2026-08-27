@@ -132,6 +132,7 @@ def calculate_quote(quote_draft: dict) -> dict:
 def preview_quote(quote_draft: dict) -> dict:
     """
     產生報價預覽（試算但不建立正式報價單）。
+    selections 以 optno 為 key，動態組合摘要文字。
 
     Returns:
         {"status": "preview", "calc": {...}, "summary": str}
@@ -140,16 +141,19 @@ def preview_quote(quote_draft: dict) -> dict:
     qty = quote_draft.get("qty", 0)
     selections = quote_draft.get("selections", {})
 
-    size_desc = selections.get("size", {}).get("codsc", "未指定")
-    mat_desc = selections.get("material", {}).get("codsc", "未指定")
-    color_desc = selections.get("color", {}).get("codsc", "未指定")
-    leg_desc = selections.get("leg", {}).get("codsc", "未指定")
+    # 動態組合已選規格說明（optdesc: codsc）
+    sel_lines = []
+    for optno, sel in selections.items():
+        optdesc = sel.get("optdesc", optno)
+        codsc = sel.get("codsc", "未指定")
+        sel_lines.append(f"  {optdesc}：{codsc}")
+
+    sel_text = "\n".join(sel_lines) if sel_lines else "  （尚未選擇規格）"
 
     summary = (
         f"📋 報價預覽\n"
-        f"  產品：辦公桌  數量：{qty} 張\n"
-        f"  尺寸：{size_desc}  材質：{mat_desc}\n"
-        f"  顏色：{color_desc}  腳架：{leg_desc}\n"
+        f"  產品：{quote_draft.get('product_name', '辦公桌')}  數量：{qty} 張\n"
+        f"{sel_text}\n"
         f"  ─────────────────────────\n"
         f"  材料成本：${calc_result['total_cost']:,.0f}\n"
         f"  小計（含加成）：${calc_result['subtotal']:,.0f}\n"

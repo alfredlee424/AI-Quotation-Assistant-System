@@ -11,6 +11,14 @@ run_quote_agent() 是對外唯一入口，由 app.py 呼叫。
   - agent/state.py   : 相同的狀態機
   - agent/rule_parser.py : 缺項提示等輔助功能（LLM 模式可選用）
 
+selections 格式（optno 驅動，對齊真實資料庫）：
+    {
+        "A001": {"optno": "A001", "optdesc": "桌面尺寸",
+                 "path": "CMT1\\A001", "code": "C001", "codsc": "60*120", "compri": 0.0},
+        "S002": {...},
+        ...
+    }
+
 回傳格式（統一）：
     (response_text: str, updated_quote: dict)
 """
@@ -20,7 +28,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from config import USE_LLM, OPENAI_API_KEY, OPENAI_MODEL
+from config import USE_LLM, OPENAI_API_KEY, OPENAI_MODEL, PRODUCT_PREFIX
 from agent.state import (
     QuoteStatus,
     check_missing_fields,
@@ -118,20 +126,44 @@ class RuleBasedAgent:
             return f"❌ 建立報價時發生錯誤：{e}", quote_draft
 
     def _apply_defaults(self, quote_draft: dict) -> dict:
-        """套用標準規格預設值"""
+        """
+        套用標準規格預設值（從真實資料庫查詢，以 optno 為 key）。
+        標準規格：A001/C001（60*120）、S002/C001（美耐板）、
+                  B001/C001（標準木腳）、S005/C001（白色）
+        """
         from database import repository as repo
-        defaults = {
-            "size":     ("DESK\\SIZE", "S1200600", "1200×600mm"),
-            "material": ("DESK\\MATS", "CLMT",     "美耐板"),
-            "color":    ("DESK\\COLOR","WHITE",     "白色"),
-            "leg":      ("DESK\\LEG",  "WLEG",      "木腳"),
-        }
+
+        defaults = [
+            ("A001", "C001"),   # 桌面尺寸 60*120
+            ("S002", "C001"),   # 材質：美耐板
+            ("B001", "C001"),   # 木腳：標準木腳
+            ("S005", "C001"),   # 顏色：白色
+        ]
+
         quote_draft.setdefault("selections", {})
-        for key, (path, code, codsc) in defaults.items():
-            if key not in quote_draft["selections"]:
-                quote_draft["selections"][key] = {
-                    "path": path, "code": code, "codsc": codsc
-                }
+
+        # 取得 optdesc 對映
+        try:
+            cats = repo.get_all_option_categories()
+            cat_map = {c["optno"]: c["optdesc"] for c in cats}
+        except Exception:
+            cat_map = {}
+
+        for optno, code in defaults:
+            if optno not in quote_draft["selections"]:
+                path = repo.build_option_path(optno)
+                options = repo.get_options_by_path(path)
+                target = next((o for o in options if o["code"] == code), None)
+                if target:
+                    quote_draft["selections"][optno] = {
+                        "optno": optno,
+                        "optdesc": cat_map.get(optno, optno),
+                        "path": path,
+                        "code": target["code"],
+                        "codsc": target["codsc"],
+                        "compri": target["compri"],
+                    }
+
         if not quote_draft.get("qty"):
             quote_draft["qty"] = 1
         return quote_draft
@@ -156,9 +188,10 @@ class LLMAgent:
             "重要規則：\n"
             "1. 你不得自行猜測或計算任何金額，所有價格必須透過 calculate_quote 工具計算\n"
             "2. 你不得自行猜測產品代碼，必須透過 search_option 工具查詢正式代碼\n"
-            "3. 資料不完整時，必須主動詢問使用者補充（數量、尺寸、材質、顏色、腳架）\n"
+            "3. 資料不完整時，必須主動詢問使用者補充（數量、桌面尺寸等必填項）\n"
             "4. 所有回覆使用繁體中文\n"
             "5. 建立正式報價前，必須明確取得使用者確認\n\n"
+            f"產品路徑格式：{{PRODUCT_PREFIX}}\\{{optno}}，例如 {PRODUCT_PREFIX}\\A001\n"
             "你可以使用以下工具：search_option、get_options_by_path、"
             "get_part_quantity、calculate_quote、preview_quote"
         )
@@ -232,7 +265,7 @@ class LLMAgent:
                 except Exception as e:
                     tool_result = {"error": str(e)}
 
-                # 更新草稿（search_option 結果）
+                # 更新草稿（search_option 結果）— 以 optno 為 key
                 if fn_name == "search_option" and tool_result.get("results"):
                     r = tool_result["results"][0]
                     self._update_draft_from_option(r, quote_draft)
@@ -252,23 +285,36 @@ class LLMAgent:
         return "抱歉，處理時發生問題，請重新描述需求。", quote_draft
 
     def _update_draft_from_option(self, result: dict, quote_draft: dict) -> None:
-        """根據搜尋結果更新報價草稿"""
+        """
+        根據搜尋結果更新報價草稿，以 optno 為 selections key。
+        """
+        from database import repository as repo
+
         path = result.get("path", "")
         code = result.get("code", "")
         codsc = result.get("codsc", "")
-        info = {"path": path, "code": code, "codsc": codsc}
+        compri = result.get("compri", 0.0)
+        optno = result.get("optno") or repo.optno_from_path(path)
 
-        quote_draft.setdefault("selections", {})
-        if "SIZE" in path:
-            quote_draft["selections"]["size"] = info
-        elif "MATS" in path:
-            quote_draft["selections"]["material"] = info
-        elif "COLOR" in path:
-            quote_draft["selections"]["color"] = info
-        elif "LEG" in path:
-            quote_draft["selections"]["leg"] = info
-        elif "TOP" in path:
-            quote_draft["selections"]["top"] = info
+        if not optno:
+            return
+
+        # 取得 optdesc
+        try:
+            cats = repo.get_all_option_categories()
+            cat_map = {c["optno"]: c["optdesc"] for c in cats}
+            optdesc = cat_map.get(optno, optno)
+        except Exception:
+            optdesc = optno
+
+        quote_draft.setdefault("selections", {})[optno] = {
+            "optno": optno,
+            "optdesc": optdesc,
+            "path": path,
+            "code": code,
+            "codsc": codsc,
+            "compri": compri,
+        }
 
 
 # ============================================================

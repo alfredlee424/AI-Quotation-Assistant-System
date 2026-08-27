@@ -13,6 +13,17 @@ UI、AI Agent 與計價引擎均不得直接執行 SQL，只能呼叫此模組�
   - get_option_price()      : 取得選項採購成本（用於計價）
   - save_quote_snapshot()   : 將報價快照寫入 ordqdt_ai
   - get_quote_snapshot()    : 讀取已建立的報價快照
+  - build_option_path()     : 由 optno 組合 ordspe 路徑
+  - optno_from_path()       : 由 path 解出 optno
+
+路徑格式說明：
+  真實資料庫的 ordspe.path = {PRODUCT_PREFIX}\\{optno}
+  例：CMT1\\A001（桌面尺寸）、CMT1\\B001（木腳尺寸）
+
+查詢 Bug 修正記錄（2026-08-27）：
+  ordqty.codsc 在真實資料庫全部為 NULL；
+  SQL NULL = 'xxx' 永遠為假，導致 get_part_quantity 永遠查不到。
+  修正：(workgroup, path, code) 三欄比對，移除 codsc 條件。
 """
 
 from __future__ import annotations
@@ -24,7 +35,7 @@ from sqlalchemy import or_
 
 from database.connection import get_db
 from database.models import Ordspd, Ordspe, Ordqty, ordqdt_ai
-from config import WORKGROUP
+from config import WORKGROUP, PRODUCT_PREFIX
 
 
 # ============================================================
@@ -33,6 +44,42 @@ from config import WORKGROUP
 
 def _session() -> Session:
     return get_db()
+
+
+# ============================================================
+# 路徑輔助函式
+# ============================================================
+
+def build_option_path(optno: str, prefix: str = PRODUCT_PREFIX) -> str:
+    """
+    由 optno 組合 ordspe / ordqty 的 path。
+
+    Args:
+        optno  : ordspd.optno，例如 "A001"
+        prefix : 產品路徑前綴，預設 PRODUCT_PREFIX（如 "CMT1"）
+
+    Returns:
+        str  例如 "CMT1\\A001"
+    """
+    return f"{prefix}\\{optno}"
+
+
+def optno_from_path(path: str, prefix: str = PRODUCT_PREFIX) -> str:
+    """
+    由 ordspe.path 解出 ordspd.optno。
+
+    路徑格式為 "{prefix}\\{optno}[\\{子optno}...]"，
+    取 prefix 之後、第一個反斜線之前的段落作為 optno。
+
+    Args:
+        path   : 例如 "CMT1\\A001" 或 "CMT1\\A001\\W001"
+        prefix : 產品路徑前綴，預設 PRODUCT_PREFIX
+
+    Returns:
+        str optno，例如 "A001"；若格式不符則回傳空字串
+    """
+    stripped = path.removeprefix(prefix).lstrip("\\")
+    return stripped.split("\\")[0] if stripped else ""
 
 
 # ============================================================
@@ -45,7 +92,7 @@ def search_product(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
     實際上搜尋 ordspe.codsc 與 ordspe.code 包含關鍵字的資料。
 
     Returns:
-        list[dict] 每筆含 path, code, codsc, compri
+        list[dict] 每筆含 path, code, codsc, compri, optno
     """
     db = _session()
     try:
@@ -68,6 +115,7 @@ def search_product(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
                 "code": r.code,
                 "codsc": r.codsc,
                 "compri": r.compri or 0.0,
+                "optno": optno_from_path(r.path),
             }
             for r in rows
         ]
@@ -84,7 +132,7 @@ def get_product_parts(product_path: str, workgroup: str = WORKGROUP) -> list[dic
     依產品路徑取得該產品在 ordqty 中定義的所有部件。
 
     Args:
-        product_path: 產品的根路徑，例如 "DESK\\MATS"
+        product_path: 產品的根路徑，例如 "CMT1\\A001"
 
     Returns:
         list[dict] 每筆含 path, code, codsc, part_path, stdqty, stdpar
@@ -121,10 +169,10 @@ def get_product_parts(product_path: str, workgroup: str = WORKGROUP) -> list[dic
 def search_option(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
     """
     搜尋 ordspe.codsc 與 ordspe.code 包含關鍵字的所有選項。
-    用於將「美耐板」→ CLMT、「木腳」→ WLEG 等自然語言轉成正式代碼。
+    用於將自然語言轉成正式代碼，例如「木腳」→ code=C001 path=CMT1\\B001。
 
     Returns:
-        list[dict] 每筆含 path, code, codsc, compri
+        list[dict] 每筆含 path, code, codsc, compri, optno
     """
     db = _session()
     try:
@@ -147,6 +195,7 @@ def search_option(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
                 "code": r.code,
                 "codsc": r.codsc,
                 "compri": r.compri or 0.0,
+                "optno": optno_from_path(r.path),
             }
             for r in rows
         ]
@@ -163,7 +212,7 @@ def get_options_by_path(path: str, workgroup: str = WORKGROUP) -> list[dict]:
     取得 ordspe 中某路徑下的所有可選項目。
 
     Args:
-        path: 例如 "DESK\\LEG"
+        path: 例如 "CMT1\\A001"（桌面尺寸）
 
     Returns:
         list[dict] 每筆含 code, codsc, compri
@@ -193,16 +242,24 @@ def get_options_by_path(path: str, workgroup: str = WORKGROUP) -> list[dict]:
 
 # ============================================================
 # 5. get_part_quantity - 取得部件標準用量
+#
+# 修正 Bug（2026-08-27）：
+#   原版查詢包含 codsc 條件，但真實 ordqty.codsc 全為 NULL，
+#   SQL NULL = 'xxx' 永遠為假，導致永遠查不到。
+#   改為只用 (workgroup, path, code) 三欄比對。
 # ============================================================
 
 def get_part_quantity(
     path: str,
     code: str,
-    codsc: str,
+    codsc: str = "",          # 保留參數相容舊呼叫，但不進 WHERE
     workgroup: str = WORKGROUP,
 ) -> Optional[dict]:
     """
-    依 (path, code, codsc) 取得 ordqty 中的用量規則。
+    依 (workgroup, path, code) 取得 ordqty 中的用量規則。
+
+    注意：codsc 參數保留供呼叫端傳入，但不作為查詢條件，
+    因為真實資料庫 ordqty.codsc 欄位全部為 NULL。
 
     Returns:
         dict 含 stdqty, stdpar, part_path；若不存在則回傳 None
@@ -215,7 +272,7 @@ def get_part_quantity(
                 Ordqty.workgroup == workgroup,
                 Ordqty.path == path,
                 Ordqty.code == code,
-                Ordqty.codsc == codsc,
+                # codsc 不進 WHERE（真實資料全為 NULL）
             )
             .first()
         )
@@ -224,7 +281,7 @@ def get_part_quantity(
         return {
             "path": row.path,
             "code": row.code,
-            "codsc": row.codsc,
+            "codsc": row.codsc,         # 回傳值保留（可能為 None）
             "part_path": row.part_path,
             "stdqty": row.stdqty or 1.0,
             "stdpar": row.stdpar or 1.0,
@@ -235,17 +292,23 @@ def get_part_quantity(
 
 # ============================================================
 # 6. get_option_price - 取得選項採購成本
+#
+# 修正 Bug（2026-08-27）：
+#   同上，移除 codsc WHERE 條件。
+#   改為只用 (workgroup, path, code) 三欄比對。
 # ============================================================
 
 def get_option_price(
     path: str,
     code: str,
-    codsc: str,
+    codsc: str = "",          # 保留參數相容舊呼叫，但不進 WHERE
     workgroup: str = WORKGROUP,
 ) -> float:
     """
     取得 ordspe 中某選項的採購成本（compri）。
-    計價引擎應呼叫此函式取得最新成本，再由 snapshot 複製快照值。
+
+    注意：codsc 參數保留供呼叫端傳入，但不作為查詢條件，
+    以相容 codsc 可能為 NULL 的情況。
 
     Returns:
         float 採購成本；若找不到回傳 0.0
@@ -258,7 +321,7 @@ def get_option_price(
                 Ordspe.workgroup == workgroup,
                 Ordspe.path == path,
                 Ordspe.code == code,
-                Ordspe.codsc == codsc,
+                # codsc 不進 WHERE
             )
             .first()
         )
@@ -387,7 +450,7 @@ def get_all_option_categories(workgroup: str = WORKGROUP) -> list[dict]:
     取得 ordspd 中所有選項類別定義。
 
     Returns:
-        list[dict] 每筆含 optno, optdesc, kind
+        list[dict] 每筆含 optno, optdesc, kind, code
     """
     db = _session()
     try:

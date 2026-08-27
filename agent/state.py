@@ -12,21 +12,37 @@ agent/state.py - Agent 狀態機定義
     CHECKING
      ├─ 缺少欄位 → WAITING_FOR_INPUT → (使用者補充) → CHECKING
      └─ 資料完整 → PREVIEW
-                    ↓ 使用者確認
-                  CONFIRMED
-                    ↓
-                  CREATING
-                    ↓
-                  SNAPSHOT_CREATED
-                    ↓
-                  COMPLETED
+                   ↓ 使用者確認
+                 CONFIRMED
+                   ↓
+                 CREATING
+                   ↓
+                 SNAPSHOT_CREATED
+                   ↓
+                 COMPLETED
 
 錯誤時可進入 ERROR 狀態。
+
+selections 格式（optno 驅動，對齊真實資料庫結構）：
+    {
+        "A001": {
+            "optno": "A001",
+            "optdesc": "桌面尺寸",
+            "path": "CMT1\\A001",
+            "code": "C001",
+            "codsc": "60*120",
+            "compri": 0.0,
+        },
+        "S002": {...},
+        ...
+    }
 """
 
 from __future__ import annotations
 
 from enum import Enum
+
+from config import REQUIRED_OPTNOS
 
 
 class QuoteStatus(str, Enum):
@@ -105,16 +121,20 @@ def new_quote_draft() -> dict:
     建立空白報價草稿。
     Agent 在整個對話過程中維護並更新此 dict。
 
-    結構：
+    selections 以 optno 為 key（對齊真實資料庫結構）：
     {
         "product_name": str,
         "qty": int | None,
         "selections": {
-            "size":     {"path": ..., "code": ..., "codsc": ...},
-            "material": {...},
-            "color":    {...},
-            "leg":      {...},
-            "top":      {...},
+            "A001": {
+                "optno": "A001",
+                "optdesc": "桌面尺寸",
+                "path": "CMT1\\A001",
+                "code": "C001",
+                "codsc": "60*120",
+                "compri": 0.0,
+            },
+            ...
         },
         "discount_rate": float,
         "status": QuoteStatus,
@@ -135,29 +155,35 @@ def new_quote_draft() -> dict:
     }
 
 
-# 必要欄位定義（缺少任一項無法進入 PREVIEW）
-REQUIRED_FIELDS: list[tuple[str, str]] = [
-    ("qty",       "數量"),
-    ("size",      "桌面尺寸"),
-    ("material",  "桌面材質"),
-    ("color",     "桌面顏色"),
-    ("leg",       "腳架類型"),
-]
-
-
 def check_missing_fields(quote_draft: dict) -> list[str]:
     """
     檢查報價草稿中缺少哪些必要欄位。
+
+    必填項目由 config.REQUIRED_OPTNOS 決定（如 ["A001"]），
+    表示至少要選完這些 optno 類別才能進入報價試算。
+    數量（qty）永遠必填。
 
     Returns:
         list[str] 缺少的欄位中文名稱清單，空清單表示資料完整
     """
     missing: list[str] = []
-    for field_key, field_label in REQUIRED_FIELDS:
-        if field_key == "qty":
-            if not quote_draft.get("qty"):
-                missing.append(field_label)
-        else:
-            if field_key not in quote_draft.get("selections", {}):
-                missing.append(field_label)
+
+    # 數量必填
+    if not quote_draft.get("qty"):
+        missing.append("數量")
+
+    # 依 REQUIRED_OPTNOS 檢查必填選項類別
+    selections = quote_draft.get("selections", {})
+    for optno in REQUIRED_OPTNOS:
+        if optno not in selections:
+            # 嘗試從資料庫取得 optdesc 作為顯示名稱
+            try:
+                from database import repository as repo
+                cats = repo.get_all_option_categories()
+                cat_map = {c["optno"]: c["optdesc"] for c in cats}
+                label = cat_map.get(optno, optno)
+            except Exception:
+                label = optno
+            missing.append(label)
+
     return missing

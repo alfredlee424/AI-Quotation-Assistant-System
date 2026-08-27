@@ -42,3 +42,5 @@ desktop.ini
 # 報表輸出（暫存）
 output/
 exports/
+plans/*
+test/*
