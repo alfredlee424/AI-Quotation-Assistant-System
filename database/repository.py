@@ -111,11 +111,11 @@ def search_product(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
         )
         return [
             {
-                "path": r.path,
-                "code": r.code,
-                "codsc": r.codsc,
+                "path": (r.path or "").strip(),
+                "code": (r.code or "").strip(),
+                "codsc": (r.codsc or "").strip(),
                 "compri": r.compri or 0.0,
-                "optno": optno_from_path(r.path),
+                "optno": optno_from_path((r.path or "").strip()),
             }
             for r in rows
         ]
@@ -149,10 +149,10 @@ def get_product_parts(product_path: str, workgroup: str = WORKGROUP) -> list[dic
         )
         return [
             {
-                "path": r.path,
-                "code": r.code,
-                "codsc": r.codsc,
-                "part_path": r.part_path,
+                "path": (r.path or "").strip(),
+                "code": (r.code or "").strip(),
+                "codsc": (r.codsc or "").strip() if r.codsc else None,
+                "part_path": (r.part_path or "").strip() if r.part_path else None,
                 "stdqty": r.stdqty or 1.0,
                 "stdpar": r.stdpar or 1.0,
             }
@@ -191,11 +191,11 @@ def search_option(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
         )
         return [
             {
-                "path": r.path,
-                "code": r.code,
-                "codsc": r.codsc,
+                "path": (r.path or "").strip(),
+                "code": (r.code or "").strip(),
+                "codsc": (r.codsc or "").strip(),
                 "compri": r.compri or 0.0,
-                "optno": optno_from_path(r.path),
+                "optno": optno_from_path((r.path or "").strip()),
             }
             for r in rows
         ]
@@ -230,8 +230,8 @@ def get_options_by_path(path: str, workgroup: str = WORKGROUP) -> list[dict]:
         )
         return [
             {
-                "code": r.code,
-                "codsc": r.codsc,
+                "code": (r.code or "").strip(),
+                "codsc": (r.codsc or "").strip(),
                 "compri": r.compri or 0.0,
             }
             for r in rows
@@ -279,10 +279,10 @@ def get_part_quantity(
         if row is None:
             return None
         return {
-            "path": row.path,
-            "code": row.code,
-            "codsc": row.codsc,         # 回傳值保留（可能為 None）
-            "part_path": row.part_path,
+            "path": (row.path or "").strip(),
+            "code": (row.code or "").strip(),
+            "codsc": (row.codsc or "").strip() if row.codsc else None,
+            "part_path": (row.part_path or "").strip() if row.part_path else None,
             "stdqty": row.stdqty or 1.0,
             "stdpar": row.stdpar or 1.0,
         }
@@ -462,10 +462,10 @@ def get_all_option_categories(workgroup: str = WORKGROUP) -> list[dict]:
         )
         return [
             {
-                "optno": r.optno,
-                "optdesc": r.optdesc,
-                "kind": r.kind,
-                "code": r.code,
+                "optno": (r.optno or "").strip(),
+                "optdesc": (r.optdesc or "").strip(),
+                "kind": (r.kind or "").strip() if r.kind else None,
+                "code": (r.code or "").strip() if r.code else None,
             }
             for r in rows
         ]

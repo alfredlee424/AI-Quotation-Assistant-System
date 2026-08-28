@@ -128,13 +128,17 @@ class RuleBasedAgent:
     def _apply_defaults(self, quote_draft: dict) -> dict:
         """
         套用標準規格預設值（從真實資料庫查詢，以 optno 為 key）。
-        標準規格：A001/C001（60*120）、S002/C001（美耐板）、
+        標準規格：A001/C003（60*120）、S002/C001（美耐板）、
                   B001/C001（標準木腳）、S005/C001（白色）
+
+        注意：真實資料庫（ordspe.txt）中 A001 的 code 對應：
+          C001 = 60*60  ← 非標準
+          C003 = 60*120 ← 標準規格
         """
         from database import repository as repo
 
         defaults = [
-            ("A001", "C001"),   # 桌面尺寸 60*120
+            ("A001", "C003"),   # 桌面尺寸 60*120（真實 DB：C003）
             ("S002", "C001"),   # 材質：美耐板
             ("B001", "C001"),   # 木腳：標準木腳
             ("S005", "C001"),   # 顏色：白色
