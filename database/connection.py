@@ -7,7 +7,7 @@ database/connection.py - SQLAlchemy 資料庫連線管理
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
-from config import DB_CONN_STR, IS_SQLITE
+from config import DB_CONN_STR, IS_SQLITE, IS_MYSQL, IS_MSSQL
 
 
 # ============================================================
@@ -25,6 +25,14 @@ def _build_engine():
         @event.listens_for(engine, "connect")
         def _enable_fk(dbapi_conn, _):
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    elif IS_MYSQL:
+        engine = create_engine(
+            DB_CONN_STR,
+            pool_pre_ping=True,   # 自動偵測斷線重連
+            echo=False,
+        )
+        
     else:
         # MSSQL：fast_executemany 提升批次寫入效率
         engine = create_engine(

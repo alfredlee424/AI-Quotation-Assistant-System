@@ -3,21 +3,29 @@ agent/rule_parser.py - 規則式自然語言解析器
 
 無需 LLM API 即可從使用者輸入中擷取：
   - 數量（20張、100張、20個）
-  - 桌面尺寸（60*120、75*180、120x75）
-  - 材質關鍵字（美耐板、實木、玻璃）→ 查詢對應 optno=S002
-  - 腳架關鍵字（木腳、鐵腳）→ 查詢對應 optno=B001/B002
-  - 顏色關鍵字（白色、黑色、胡桃）→ 查詢對應 optno=S005
+  - 桌面尺寸（60*120、75*180、120x75）→ 查詢 optno=A001 根節點
+  - 板材關鍵字（MDF、夾板）→ 查詢 CMT1\\A001\\S004 路徑
+  - 色紙關鍵字（胡桃、白橡）→ 查詢 CMT1\\A001\\S005\\S001 路徑
+  - 腳架關鍵字（45寬、55寬、木腳）→ 查詢 optno=B001 根節點
   - 確認意圖（是、確認、建立、OK）
   - 取消意圖（否、取消、不要）
 
 並查詢資料庫將關鍵字轉成正式代碼（optno 驅動）。
 
+路徑結構（巢狀樹，對應真實 DB 與 seed_data）：
+    CMT1\\A001         → 桌面尺寸根節點（C001=60*120, C002=60*150, C003=60*180）
+    CMT1\\A001\\S004   → 板材子部件（C001=25mm MDF, C002=18mm 夾板）
+    CMT1\\A001\\S005\\S001 → 色紙子部件（C001=817胡桃, C003=932揚胡桃）
+    CMT1\\B001         → 木腳根節點（C001=45寬, C002=55寬, C003=60寬, C004=75寬）
+
 selections 格式（以 optno 為 key）：
     {
         "A001": {"optno": "A001", "optdesc": "桌面尺寸",
                  "path": "CMT1\\A001", "code": "C001", "codsc": "60*120", "compri": 0.0},
-        "S002": {"optno": "S002", "optdesc": "材質",
-                 "path": "CMT1\\S002", "code": "C001", "codsc": "美耐板", "compri": 500.0},
+        "S004": {"optno": "S004", "optdesc": "板材",
+                 "path": "CMT1\\A001\\S004", "code": "C001", "codsc": "25mm MDF", "compri": 700.0},
+        "B001": {"optno": "B001", "optdesc": "木腳",
+                 "path": "CMT1\\B001", "code": "C001", "codsc": "45寬環式腳", "compri": 0.0},
         ...
     }
 """
@@ -35,44 +43,40 @@ from config import WORKGROUP, PRODUCT_PREFIX
 # 關鍵字對映表（自然語言 → 資料庫搜尋關鍵字）
 # ============================================================
 
-# 材質關鍵字（搜尋 ordspe，path 含 optno=S002）
-MATERIAL_KEYWORDS: dict[str, str] = {
+# 板材關鍵字（搜尋 ordspe，path = CMT1\\A001\\S004）
+# codsc 對應 seed_data / 真實 DB 中的實際名稱
+BOARD_KEYWORDS: dict[str, str] = {
+    "MDF": "MDF",
+    "mdf": "MDF",
+    "密集板": "MDF",
+    "夾板": "夾板",
+    "合板": "夾板",
+    "木芯板": "夾板",
+}
+
+# 色紙關鍵字（搜尋 ordspe，path 前綴 = CMT1\\A001\\S005\\S001）
+# codsc 對應真實 DB 中的名稱（如 817胡桃、932揚胡桃）
+COLOR_KEYWORDS: dict[str, str] = {
+    "胡桃": "胡桃",
+    "胡桃木": "胡桃",
+    "揚胡桃": "揚胡桃",
+    "白橡": "白橡",
+    "紅木": "紅木",
     "美耐板": "美耐板",
     "美耐": "美耐板",
-    "防火板": "美耐板",
-    "實木": "實木貼皮",
-    "木紋": "實木貼皮",
-    "貼皮": "實木貼皮",
-    "玻璃": "強化玻璃",
-    "強化玻璃": "強化玻璃",
-    "密集板": "密集板",
-    "塑合板": "密集板",
 }
 
-# 顏色關鍵字（搜尋 ordspe，path 含 optno=S005）
-COLOR_KEYWORDS: dict[str, str] = {
-    "白色": "白色",
-    "白": "白色",
-    "純白": "白色",
-    "黑色": "黑色",
-    "黑": "黑色",
-    "米色": "米色",
-    "米": "米色",
-    "米白": "米色",
-    "胡桃": "胡桃木色",
-    "胡桃木": "胡桃木色",
-    "木色": "胡桃木色",
-}
-
-# 腳架關鍵字（搜尋 ordspe，path 含 optno=B001/B002）
+# 腳架關鍵字（搜尋 ordspe，path = CMT1\\B001 根節點）
+# codsc 對應 seed_data 中的實際名稱（45寬環式腳、55寬環式腳等）
 LEG_KEYWORDS: dict[str, str] = {
-    "木腳": "木腳",
-    "木製腳": "木腳",
-    "實木腳": "木腳",
-    "鐵腳": "鐵腳",
-    "金屬腳": "鐵腳",
-    "鋼管腳": "鋼管腳",
-    "鋼管": "鋼管腳",
+    "木腳": "環式腳",
+    "木製腳": "環式腳",
+    "實木腳": "環式腳",
+    "45寬": "45寬",
+    "55寬": "55寬",
+    "60寬": "60寬",
+    "75寬": "75寬",
+    "環式腳": "環式腳",
 }
 
 # 確認意圖關鍵字
@@ -199,48 +203,85 @@ def extract_size(text: str) -> Optional[dict]:
 
 
 # ============================================================
-# 材質解析（optno=S002）
+# 板材解析（CMT1\\A001\\S004 子部件）
 # ============================================================
 
-def extract_material(text: str) -> Optional[dict]:
-    """從文字擷取桌面材質（optno=S002）並查詢正式代碼"""
-    for kw, search_kw in MATERIAL_KEYWORDS.items():
+def extract_board(text: str) -> Optional[dict]:
+    """
+    從文字擷取板材規格（CMT1\\A001\\S004）並查詢正式代碼。
+    回傳 selections entry，optno 使用 "S004"。
+    """
+    board_path_prefix = f"{PRODUCT_PREFIX}\\A001\\S004"
+    for kw, search_kw in BOARD_KEYWORDS.items():
         if kw in text:
-            result = _lookup_option_by_optno(search_kw, "S002")
-            if result:
-                return result
+            results = repo.search_option(keyword=search_kw, workgroup=WORKGROUP)
+            filtered = [r for r in results if r.get("path", "") == board_path_prefix]
+            if filtered:
+                r = filtered[0]
+                return {
+                    "optno": "S004",
+                    "optdesc": "板材",
+                    "path": r["path"],
+                    "code": r["code"],
+                    "codsc": r["codsc"],
+                    "compri": r["compri"],
+                }
     return None
 
 
 # ============================================================
-# 顏色解析（optno=S005）
+# 色紙解析（CMT1\\A001\\S005\\S001 子部件）
 # ============================================================
 
 def extract_color(text: str) -> Optional[dict]:
-    """從文字擷取顏色（optno=S005）並查詢正式代碼"""
+    """
+    從文字擷取表板色紙（CMT1\\A001\\S005\\S001）並查詢正式代碼。
+    回傳 selections entry，optno 使用 "S001"。
+    """
+    color_path_prefix = f"{PRODUCT_PREFIX}\\A001\\S005\\S001"
     for kw, search_kw in COLOR_KEYWORDS.items():
         if kw in text:
-            result = _lookup_option_by_optno(search_kw, "S005")
-            if result:
-                return result
+            results = repo.search_option(keyword=search_kw, workgroup=WORKGROUP)
+            filtered = [r for r in results if r.get("path", "") == color_path_prefix]
+            if filtered:
+                r = filtered[0]
+                return {
+                    "optno": "S001",
+                    "optdesc": "色紙",
+                    "path": r["path"],
+                    "code": r["code"],
+                    "codsc": r["codsc"],
+                    "compri": r["compri"],
+                }
     return None
 
 
 # ============================================================
-# 腳架解析（optno=B001 木腳 / B002 鐵腳）
+# 腳架解析（CMT1\\B001 根節點）
 # ============================================================
 
 def extract_leg(text: str) -> Optional[dict]:
-    """從文字擷取腳架類型（optno=B001 或 B002）並查詢正式代碼"""
+    """
+    從文字擷取腳架類型（CMT1\\B001 根節點）並查詢正式代碼。
+    回傳 selections entry，optno 使用 "B001"。
+    """
+    leg_path = repo.build_option_path("B001")
     for kw, search_kw in LEG_KEYWORDS.items():
         if kw in text:
-            # 先找 B001（木腳類），再找 B002（鐵腳類）
-            result = (
-                _lookup_option_by_optno(search_kw, "B001") or
-                _lookup_option_by_optno(search_kw, "B002")
-            )
-            if result:
-                return result
+            results = repo.search_option(keyword=search_kw, workgroup=WORKGROUP)
+            filtered = [r for r in results if r.get("path", "") == leg_path]
+            if filtered:
+                r = filtered[0]
+                cats = repo.get_all_option_categories()
+                cat_map = {c["optno"]: c["optdesc"] for c in cats}
+                return {
+                    "optno": "B001",
+                    "optdesc": cat_map.get("B001", "木腳"),
+                    "path": r["path"],
+                    "code": r["code"],
+                    "codsc": r["codsc"],
+                    "compri": r["compri"],
+                }
     return None
 
 
@@ -291,17 +332,17 @@ def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str
         quote_draft.setdefault("selections", {})[size["optno"]] = size
         found.append(f"桌面尺寸：{size['codsc']}")
 
-    # 材質（S002）
-    material = extract_material(user_input)
-    if material:
-        quote_draft.setdefault("selections", {})[material["optno"]] = material
-        found.append(f"材質：{material['codsc']}")
+    # 板材（S004，CMT1\\A001\\S004）
+    board = extract_board(user_input)
+    if board:
+        quote_draft.setdefault("selections", {})[board["optno"]] = board
+        found.append(f"板材：{board['codsc']}")
 
-    # 顏色（S005）
+    # 色紙（S001，CMT1\\A001\\S005\\S001）
     color = extract_color(user_input)
     if color:
         quote_draft.setdefault("selections", {})[color["optno"]] = color
-        found.append(f"顏色：{color['codsc']}")
+        found.append(f"色紙：{color['codsc']}")
 
     # 腳架（B001 / B002）
     leg = extract_leg(user_input)

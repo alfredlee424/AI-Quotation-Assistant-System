@@ -128,21 +128,24 @@ class RuleBasedAgent:
     def _apply_defaults(self, quote_draft: dict) -> dict:
         """
         套用標準規格預設值（從真實資料庫查詢，以 optno 為 key）。
-        標準規格：A001/C003（60*120）、S002/C001（美耐板）、
-                  B001/C001（標準木腳）、S005/C001（白色）
 
-        注意：真實資料庫（ordspe.txt）中 A001 的 code 對應：
-          C001 = 60*60  ← 非標準
-          C003 = 60*120 ← 標準規格
+        預設值涵蓋根節點與子部件，確保計算引擎有足夠的有成本項目：
+          根節點（compri=0，作為驅動代碼來源）：
+            A001/C001 → CMT1\\A001  60*120
+            B001/C001 → CMT1\\B001  45寬環式腳
+          子部件（compri>0，實際計入成本）：
+            CMT1\\A001\\S004    / C001 → 25mm MDF（板材）
+            CMT1\\A001\\W001\\W010 / C001 → 裁切費
+            CMT1\\A001\\W001\\W030 / C001 → 木工費
+            CMT1\\B001\\S004    / C001 → MDF 4*8*18mm（腳板材）
+
+        selections dict 的 key 規則：
+          - 根節點：optno（如 "A001"、"B001"）
+          - 子部件：path 去掉 PRODUCT_PREFIX 後的段落（如 "A001\\S004"）
+            確保不同產品樹下同名子部件（如 A001\\S004 和 B001\\S004）不衝突
         """
         from database import repository as repo
-
-        defaults = [
-            ("A001", "C003"),   # 桌面尺寸 60*120（真實 DB：C003）
-            ("S002", "C001"),   # 材質：美耐板
-            ("B001", "C001"),   # 木腳：標準木腳
-            ("S005", "C001"),   # 顏色：白色
-        ]
+        from config import PRODUCT_PREFIX
 
         quote_draft.setdefault("selections", {})
 
@@ -153,16 +156,30 @@ class RuleBasedAgent:
         except Exception:
             cat_map = {}
 
-        for optno, code in defaults:
-            if optno not in quote_draft["selections"]:
-                path = repo.build_option_path(optno)
-                options = repo.get_options_by_path(path)
+        # ── 格式：(full_path, code, sel_key, optno, optdesc_fallback) ──────
+        # sel_key 為 selections dict 的 key，path 去前綴後作為唯一識別
+        prefix = PRODUCT_PREFIX
+        defaults = [
+            # 根節點（compri=0，作為子部件 stdqty 的驅動代碼來源）
+            (f"{prefix}\\A001",             "C001", "A001",          "A001", "桌面尺寸"),
+            (f"{prefix}\\B001",             "C001", "B001",          "B001", "木腳"),
+            # A001 樹子部件（有成本）
+            (f"{prefix}\\A001\\S004",       "C001", "A001\\S004",   "S004", "板材"),
+            (f"{prefix}\\A001\\W001\\W010", "C001", "A001\\W001\\W010", "W010", "裁切費"),
+            (f"{prefix}\\A001\\W001\\W030", "C001", "A001\\W001\\W030", "W030", "木工費"),
+            # B001 樹子部件（有成本）
+            (f"{prefix}\\B001\\S004",       "C001", "B001\\S004",   "S004", "腳板材"),
+        ]
+
+        for full_path, code, sel_key, optno, optdesc_fb in defaults:
+            if sel_key not in quote_draft["selections"]:
+                options = repo.get_options_by_path(full_path)
                 target = next((o for o in options if o["code"] == code), None)
                 if target:
-                    quote_draft["selections"][optno] = {
+                    quote_draft["selections"][sel_key] = {
                         "optno": optno,
-                        "optdesc": cat_map.get(optno, optno),
-                        "path": path,
+                        "optdesc": cat_map.get(optno, optdesc_fb),
+                        "path": full_path,
                         "code": target["code"],
                         "codsc": target["codsc"],
                         "compri": target["compri"],

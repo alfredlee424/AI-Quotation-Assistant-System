@@ -16,18 +16,38 @@ selections 格式（optno 驅動，對齊真實資料庫）：
             "optno": "A001",
             "optdesc": "桌面尺寸",
             "path": "CMT1\\A001",
-            "code": "C001",
-            "codsc": "60*120",
+            "code": "C005",       # 使用者選的尺寸代碼
+            "codsc": "60*180",
             "compri": 0.0,
         },
-        "S002": {...},  # 材質
-        "B001": {...},  # 木腳
+        "S004": {
+            "optno": "S004",
+            "optdesc": "板材",
+            "path": "CMT1\\A001\\S004",   # 子部件路徑（A001 樹下）
+            "code": "C001",               # 材質代碼（S004 自身）
+            "codsc": "25mm MDF",
+            "compri": 700.0,
+        },
+        "B001": {...},  # 木腳根節點
         ...
     }
 
 路徑格式說明：
     ordspe.path = {PRODUCT_PREFIX}\\{optno}  （如 CMT1\\A001）
-    查詢只用 (workgroup, path, code)，不用 codsc（真實 ordqty.codsc 全為 NULL）
+    子部件路徑  = {PRODUCT_PREFIX}\\{root_optno}\\{sub_optno}\\...（如 CMT1\\A001\\S004）
+
+ordqty 查詢規則（已驗證）：
+    ordqty.path = 子部件完整路徑（如 CMT1\\A001\\S004）
+    ordqty.code = 產品樹根節點當下所選代碼（如 A001 選 C005 = 60*180）
+    → 同一子部件的 stdqty 會因「選了哪個尺寸」而不同
+    → 查詢時須用「驅動根節點所選代碼」，而非子部件自身代碼
+
+    真實範例：
+      get_part_quantity(path="CMT1\\A001\\S004", code="C005") → stdqty=4.5
+      get_part_quantity(path="CMT1\\B001\\S004", code="C001") → stdqty=8.0
+
+    若子部件路徑只有一層（如 CMT1\\B001），驅動節點即為自身。
+    查詢不使用 codsc（真實 ordqty.codsc 全為 NULL）。
 """
 
 from __future__ import annotations
@@ -35,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config import MARKUP_RATE, TAX_RATE, MAX_DISCOUNT_RATE
+from config import MARKUP_RATE, TAX_RATE, MAX_DISCOUNT_RATE, PRODUCT_PREFIX
 from database import repository as repo
 
 
@@ -159,6 +179,64 @@ def calculate_quote(
 
 
 # ============================================================
+# 輔助函式：推導驅動根節點
+# ============================================================
+
+def _get_root_optno(path: str, prefix: str = PRODUCT_PREFIX) -> str:
+    """
+    從子部件完整路徑取出產品樹根節點的 optno。
+
+    規則：去掉路徑前綴後，取第一個 optno 段。
+
+    範例：
+        "CMT1\\A001"              → "A001"
+        "CMT1\\A001\\S004"        → "A001"
+        "CMT1\\A001\\S005\\S001"  → "A001"
+        "CMT1\\B001\\S004"        → "B001"
+
+    Args:
+        path   : 子部件完整路徑（如 CMT1\\A001\\S004）
+        prefix : 產品路徑前綴（如 CMT1）
+
+    Returns:
+        根節點 optno 字串（如 "A001"）；若解析失敗回傳空字串
+    """
+    stripped = path.strip()
+    pfx = prefix.strip()
+    # 去掉前綴與緊接的分隔符
+    if stripped.startswith(pfx + "\\"):
+        tail = stripped[len(pfx) + 1:]
+    elif stripped.startswith(pfx):
+        tail = stripped[len(pfx):]
+    else:
+        tail = stripped
+    # 取第一段（即根節點 optno）
+    return tail.split("\\")[0] if tail else ""
+
+
+def _get_driver_code(path: str, selections: dict, prefix: str = PRODUCT_PREFIX) -> str:
+    """
+    取得指定子部件路徑所對應的「驅動根節點所選代碼」。
+
+    ordqty 查詢規則（已用 QU26731001 / QU26824014 雙重驗證）：
+        ordqty.code = 產品樹根節點（part_path）當下所選的代碼
+        例：CMT1\\A001\\S004 的 stdqty，要用 A001 所選尺寸代碼（C005）查詢，
+            而非 S004 自身的材質代碼（C001）。
+
+    Args:
+        path       : 子部件完整路徑（如 CMT1\\A001\\S004）
+        selections : 報價草稿的 selections dict（以 optno 為 key）
+        prefix     : 產品路徑前綴（如 CMT1）
+
+    Returns:
+        驅動根節點的選擇代碼字串；若根節點不在 selections 中，回傳空字串
+    """
+    root_optno = _get_root_optno(path, prefix)
+    root_sel = selections.get(root_optno, {})
+    return root_sel.get("code", "")
+
+
+# ============================================================
 # 從報價草稿（dict）計算
 # ============================================================
 
@@ -175,23 +253,35 @@ def calculate_from_draft(quote_draft: dict) -> CalcResult:
                 "optno": "A001",
                 "optdesc": "桌面尺寸",
                 "path": "CMT1\\A001",
-                "code": "C001",
-                "codsc": "60*120",
+                "code": "C005",         # 使用者選的尺寸代碼（驅動 A001 樹所有子部件）
+                "codsc": "60*180",
                 "compri": 0.0,
             },
-            "S002": {
-                "optno": "S002",
-                "optdesc": "材質",
-                "path": "CMT1\\S002",
-                "code": "C001",
-                "codsc": "美耐板",
-                "compri": 500.0,
+            "S004": {
+                "optno": "S004",
+                "optdesc": "板材",
+                "path": "CMT1\\A001\\S004",   # A001 樹的子部件
+                "code": "C001",               # S004 自身選擇（材質）
+                "codsc": "25mm MDF",
+                "compri": 700.0,
             },
-            "B001": {...},   # 木腳
-            "W030": {...},   # 木工費
+            "B001": {
+                "optno": "B001",
+                "optdesc": "木腳尺寸",
+                "path": "CMT1\\B001",
+                "code": "C001",         # 使用者選的木腳代碼（驅動 B001 樹所有子部件）
+                "codsc": "45寬環式腳",
+                "compri": 0.0,
+            },
         },
         "discount_rate": 0.0,
     }
+
+    ordqty 查詢修正說明：
+        - 修正前（錯誤）：用每個選項自身的 code 查 ordqty
+          → CMT1\\A001\\S004 用 code=C001（材質代碼），查不到正確 stdqty，fallback 為 1.0
+        - 修正後（正確）：用子部件所屬產品樹根節點所選的 code 查 ordqty
+          → CMT1\\A001\\S004 用 A001 的 code=C005（尺寸代碼），正確取得 stdqty=4.5
     """
     qty: float = float(quote_draft.get("qty", 1))
     selections: dict = quote_draft.get("selections", {})
@@ -205,15 +295,22 @@ def calculate_from_draft(quote_draft: dict) -> CalcResult:
         codsc = sel.get("codsc", "")
         optdesc = sel.get("optdesc", "")
 
+        # ── 修正核心：取驅動根節點所選代碼查 ordqty ─────────────
+        # 真實 ordqty 結構：ordqty.code = 驅動根節點（part_path）所選代碼
+        # 例：CMT1\A001\S004 的 stdqty 必須用 A001 的 code（如 C005=60*180）查詢
+        driver_code = _get_driver_code(path, selections)
+        # 若找不到驅動代碼（根節點不在 selections），fallback 用自身 code
+        lookup_code = driver_code if driver_code else code
+
         # 取得用量規則（不傳 codsc，因真實 ordqty.codsc 全為 NULL）
-        qty_rule = repo.get_part_quantity(path=path, code=code)
+        qty_rule = repo.get_part_quantity(path=path, code=lookup_code)
         stdqty = qty_rule["stdqty"] if qty_rule else 1.0
         stdpar = qty_rule["stdpar"] if qty_rule else 1.0
 
-        # 取得最新採購成本（快照前的主檔值）
+        # 取得最新採購成本（快照前的主檔值），仍用部件自身 code 查 ordspe
         compri = repo.get_option_price(path=path, code=code)
 
-        # compri = 0 時略過此項（無成本的選項，如標準顏色）
+        # compri = 0 時略過此項（無成本的結構節點，如桌面尺寸根節點、標準顏色）
         if compri == 0.0:
             continue
 
