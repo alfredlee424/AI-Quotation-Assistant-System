@@ -49,6 +49,8 @@ BOARD_KEYWORDS: dict[str, str] = {
     "MDF": "MDF",
     "mdf": "MDF",
     "密集板": "MDF",
+    "美耐板": "MDF",   # 美耐板桌面底材預設使用 MDF
+    "美耐": "MDF",
     "夾板": "夾板",
     "合板": "夾板",
     "木芯板": "夾板",

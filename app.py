@@ -169,7 +169,7 @@ with left_col:
             st.rerun()
     with btn_cols[2]:
         if st.button("📋 範例需求", use_container_width=True):
-            prompt = "我要 20 張 60*120 的桌子，美耐板白色，木腳"
+            prompt = "我要 20 張 60*120 的桌子，MDF，胡桃，木腳"
             st.session_state.messages.append({"role": "user", "content": prompt})
             response, updated_quote = run_quote_agent(
                 user_input=prompt,
