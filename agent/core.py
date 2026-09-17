@@ -26,9 +26,10 @@ selections 格式（optno 驅動，對齊真實資料庫）：
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
-from config import USE_LLM, OPENAI_API_KEY, OPENAI_MODEL, PRODUCT_PREFIX
+from config import USE_LLM, USE_AZURE, OPENAI_API_KEY, OPENAI_MODEL, PRODUCT_PREFIX, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION
 from agent.state import (
     QuoteStatus,
     check_missing_fields,
@@ -40,9 +41,12 @@ from agent.tools import dispatch_tool, preview_quote, create_quote, TOOLS_SCHEMA
 from agent.rule_parser import (
     parse_and_update,
     format_missing_prompt,
+    format_candidate_confirmation,
+    select_candidate,
     is_confirm,
     is_cancel,
 )
+from agent.quotation_importer import restore_historical_matches
 from utils.logger import log_action
 
 
@@ -75,6 +79,22 @@ class RuleBasedAgent:
             quote_draft = new_quote_draft()
             return "已取消目前報價，請重新輸入需求。", quote_draft
 
+        pending = quote_draft.get("pending_options", [])
+        resolved_pending = False
+        if pending:
+            selected = select_candidate(user_input, pending)
+            if selected:
+                selection_key = selected["optno"]
+                if quote_draft.get("imported_quote"):
+                    selection_key = selected.get("path", "").removeprefix(
+                        f"{PRODUCT_PREFIX}\\"
+                    )
+                quote_draft.setdefault("selections", {})[selection_key] = selected
+                quote_draft.pop("pending_options", None)
+                resolved_pending = True
+            else:
+                quote_draft.pop("pending_options", None)
+
         # ── 確認建立報價 ───────────────────────────────────
         if status == QuoteStatus.PREVIEW and is_confirm(user_input):
             return self._do_create_quote(quote_draft)
@@ -85,7 +105,15 @@ class RuleBasedAgent:
 
         # ── 解析輸入，更新草稿 ────────────────────────────
         quote_draft["status"] = QuoteStatus.ANALYZING
-        quote_draft, found_fields = parse_and_update(user_input, quote_draft)
+        if resolved_pending:
+            found_fields = []
+        else:
+            quote_draft, found_fields = parse_and_update(user_input, quote_draft)
+        restore_historical_matches(user_input, quote_draft)
+
+        if quote_draft.get("pending_options"):
+            quote_draft["status"] = QuoteStatus.WAITING_FOR_INPUT
+            return format_candidate_confirmation(quote_draft["pending_options"]), quote_draft
 
         # ── 檢查必要欄位 ───────────────────────────────────
         quote_draft["status"] = QuoteStatus.CHECKING
@@ -201,17 +229,34 @@ class LLMAgent:
     """
 
     def __init__(self) -> None:
-        from openai import OpenAI
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
+        if USE_AZURE:
+            from openai import AzureOpenAI
+            self.client = AzureOpenAI(
+                api_key=OPENAI_API_KEY,
+                azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                api_version=AZURE_OPENAI_API_VERSION,
+            )
+        else:
+            from openai import OpenAI
+            self.client = OpenAI(api_key=OPENAI_API_KEY)
+
         self.system_prompt = (
             "你是一個專業的辦公家具報價助理。\n"
             "你的工作是協助業務人員從自然語言需求產生正式報價單。\n\n"
             "重要規則：\n"
             "1. 你不得自行猜測或計算任何金額，所有價格必須透過 calculate_quote 工具計算\n"
             "2. 你不得自行猜測產品代碼，必須透過 search_option 工具查詢正式代碼\n"
-            "3. 資料不完整時，必須主動詢問使用者補充（數量、桌面尺寸等必填項）\n"
-            "4. 所有回覆使用繁體中文\n"
-            "5. 建立正式報價前，必須明確取得使用者確認\n\n"
+            "3. 程式提供 allowed_options 時，只能列出其中的選項，不得自行新增或修改\n"
+            "4. 資料不完整時，必須主動詢問使用者補充（數量、桌面尺寸等必填項）\n"
+            "5. 所有回覆使用繁體中文\n"
+            "6. 建立正式報價前，必須明確取得使用者確認\n\n"
+            "7. ordspd 的 optno 是獨立選項類別，不是互斥產品型號。A001=桌面尺寸、"
+            "B001=木腳、B002=鐵腳、C001=轉盤尺寸可以依資料庫規則同時存在；"
+            "不可因為 path 分別是 CMT1\\A001 與 CMT1\\B001 就判定不能混搭。\n"
+            "8. 每個選項必須使用其自身資料庫 path 的 code；不要把 B001 的代碼放到 A001，"
+            "也不要自行產生如『2317胡桃美耐板』這類資料庫不存在的規格。"
+            "注意：ordspd.optno（例如 C001）與 ordspe.code（例如各 path 下的 C001）是不同欄位，"
+            "不可混為一談。\n\n"
             f"產品路徑格式：{{PRODUCT_PREFIX}}\\{{optno}}，例如 {PRODUCT_PREFIX}\\A001\n"
             "你可以使用以下工具：search_option、get_options_by_path、"
             "get_part_quantity、calculate_quote、preview_quote"
@@ -237,8 +282,76 @@ class LLMAgent:
         if is_cancel(user_input):
             return "已取消目前報價，請重新輸入需求。", new_quote_draft()
 
+        # 模糊候選必須先由使用者確認，確認後才允許寫入草稿。
+        pending = quote_draft.get("pending_options", [])
+        resolved_pending = False
+        if pending:
+            selected = self._select_pending_option(user_input, pending)
+            if selected:
+                self._update_draft_from_option(selected, quote_draft)
+                quote_draft.pop("pending_options", None)
+                resolved_pending = True
+            elif user_input.strip():
+                # 使用者提供新描述時，放棄上一批候選並重新搜尋。
+                quote_draft.pop("pending_options", None)
+
+        # 標準規格由程式直接套用，避免 LLM 模式只把指令當成一般文字，
+        # 導致數量與桌面尺寸仍被判定為缺少。沿用規則式 Agent 的資料庫
+        # 查詢與預設值邏輯，且只補入尚未存在的選擇，不覆蓋使用者已選內容。
+        used_standard_defaults = "標準規格" in user_input or "預設" in user_input
+        if used_standard_defaults:
+            quote_draft = RuleBasedAgent()._apply_defaults(quote_draft)
+
+        # 先以程式解析並檢查缺漏，避免把資料庫規則交給 LLM 自行判斷。
+        if not resolved_pending:
+            quote_draft, _ = parse_and_update(user_input, quote_draft)
+        restore_historical_matches(user_input, quote_draft)
+        missing = check_missing_fields(quote_draft)
+        missing_options = self._get_missing_options(quote_draft, missing)
+        quote_draft["missing_fields"] = missing
+
+        # 標準規格已由程式完成所有必要條件時，直接使用正式報價引擎試算，
+        # 不依賴 LLM 是否正確呼叫 preview_quote，確保按鈕可立即顯示報價。
+        if used_standard_defaults and not missing:
+            quote_draft["status"] = QuoteStatus.PREVIEW
+            preview = preview_quote(quote_draft)
+            quote_draft["calc_result"] = preview["calc"]
+            return (
+                preview["summary"]
+                + "\n\n請回覆「確認建立」建立正式報價單，或繼續修改規格。",
+                quote_draft,
+            )
+
         # 加入使用者訊息
         chat_messages = [{"role": "system", "content": self.system_prompt}]
+        if missing:
+            chat_messages.append({
+                "role": "system",
+                "content": (
+                    "程式已完成缺漏檢查。只能從下列 allowed_options 回覆，"
+                    "不得自行新增或推測選項：\n"
+                    + json.dumps(missing_options, ensure_ascii=False)
+                ),
+            })
+        if quote_draft.get("imported_quote"):
+            historical = [
+                {
+                    "path": row.get("path"),
+                    "code": row.get("opt_code"),
+                    "spec": row.get("spec_desc"),
+                }
+                for row in quote_draft["imported_quote"].get("source_rows", [])
+                if row.get("opt_code") and row.get("spec_desc")
+            ]
+            chat_messages.append({
+                "role": "system",
+                "content": (
+                    "這是一張已匯入的歷史報價。若使用者只是重述下列規格，"
+                    "必須沿用相同 path/code，不要改用其他路徑的相近候選；"
+                    "只有使用者明確說『改成』時才重新搜尋。歷史規格如下：\n"
+                    + json.dumps(historical, ensure_ascii=False)
+                ),
+            })
         chat_messages.extend(messages[-10:])  # 保留最近 10 則對話（控制 Token）
         chat_messages.append({"role": "user", "content": user_input})
 
@@ -258,9 +371,12 @@ class LLMAgent:
             # 無 Tool Call → 直接回覆
             if not msg.tool_calls:
                 reply = msg.content or ""
-                # 嘗試從對話中更新草稿（規則式輔助）
-                quote_draft, _ = parse_and_update(user_input, quote_draft)
+                # 再次檢查，確保 LLM 回覆不會繞過程式規則。
+                if not resolved_pending:
+                    quote_draft, _ = parse_and_update(user_input, quote_draft)
+                restore_historical_matches(user_input, quote_draft)
                 missing = check_missing_fields(quote_draft)
+                missing_options = self._get_missing_options(quote_draft, missing)
                 if not missing and quote_draft["status"] not in (
                     QuoteStatus.PREVIEW, QuoteStatus.SNAPSHOT_CREATED
                 ):
@@ -268,6 +384,12 @@ class LLMAgent:
                 elif missing:
                     quote_draft["status"] = QuoteStatus.WAITING_FOR_INPUT
                 quote_draft["missing_fields"] = missing
+                if missing:
+                    if quote_draft.get("pending_options"):
+                        return format_candidate_confirmation(
+                            quote_draft["pending_options"]
+                        ), quote_draft
+                    return format_missing_prompt(missing, quote_draft, missing_options), quote_draft
                 return reply, quote_draft
 
             # 處理 Tool Calls
@@ -275,6 +397,22 @@ class LLMAgent:
             for tc in msg.tool_calls:
                 fn_name = tc.function.name
                 fn_args = json.loads(tc.function.arguments)
+
+                # LLM 可能先呼叫全域模糊搜尋；匯入歷史報價時，
+                # 在每次計價工具前重新套用原始 path/code，避免候選覆蓋歷史組合。
+                restore_historical_matches(user_input, quote_draft)
+
+                if fn_name == "create_quote":
+                    tool_result = {
+                        "blocked": True,
+                        "message": "禁止由 LLM 直接建立正式報價；請先顯示 PREVIEW，等待使用者按下確認按鈕。",
+                    }
+                    chat_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    })
+                    continue
 
                 # 若 calculate_quote / preview_quote 傳入 quote_draft，注入目前草稿
                 if fn_name in ("calculate_quote", "preview_quote"):
@@ -288,8 +426,18 @@ class LLMAgent:
 
                 # 更新草稿（search_option 結果）— 以 optno 為 key
                 if fn_name == "search_option" and tool_result.get("results"):
-                    r = tool_result["results"][0]
-                    self._update_draft_from_option(r, quote_draft)
+                    results = tool_result["results"]
+                    if tool_result.get("requires_confirmation"):
+                        quote_draft["pending_options"] = results
+                    elif len(results) == 1:
+                        self._update_draft_from_option(results[0], quote_draft)
+                    else:
+                        tool_result = {
+                            "ambiguous": True,
+                            "count": len(results),
+                            "results": results,
+                            "message": "找到多筆資料，請使用者確認後才能寫入報價草稿。",
+                        }
 
                 # preview 結果更新草稿
                 if fn_name == "preview_quote" and tool_result.get("calc"):
@@ -304,6 +452,39 @@ class LLMAgent:
 
         # 超過最大 Tool Call 次數
         return "抱歉，處理時發生問題，請重新描述需求。", quote_draft
+
+    @staticmethod
+    def _select_pending_option(user_input: str, candidates: list[dict]) -> dict | None:
+        """依編號、代碼或明確確認選取候選；回傳值必須是資料庫候選原物件。"""
+        text = user_input.strip()
+        match = re.search(r"(?:第\s*)?(\d+)\s*(?:個|項|號)?", text)
+        if match:
+            index = int(match.group(1)) - 1
+            if 0 <= index < len(candidates):
+                return candidates[index]
+        for candidate in candidates:
+            if candidate.get("code") and candidate["code"].lower() in text.lower():
+                return candidate
+        if is_confirm(text) and candidates:
+            return candidates[0]
+        return None
+
+    def _get_missing_options(self, quote_draft: dict, missing: list[str]) -> dict[str, list[dict]]:
+        """依缺漏 optno 查詢資料庫選項，建立給 LLM 與 UI 使用的白名單。"""
+        from config import REQUIRED_OPTNOS
+        from database import repository as repo
+
+        selections = quote_draft.get("selections", {})
+        missing_optnos = [optno for optno in REQUIRED_OPTNOS if optno not in selections]
+        if not missing:
+            return {}
+
+        result: dict[str, list[dict]] = {}
+        for optno in missing_optnos:
+            path = repo.build_option_path(optno)
+            result[optno] = repo.get_options_by_path(path)
+        quote_draft["allowed_options"] = result
+        return result
 
     def _update_draft_from_option(self, result: dict, quote_draft: dict) -> None:
         """
@@ -320,6 +501,16 @@ class LLMAgent:
         if not optno:
             return
 
+        # 只接受資料庫中確實存在的 path + code，拒絕 LLM 自行捏造的規格。
+        db_option = next(
+            (item for item in repo.get_options_by_path(path) if item["code"] == code),
+            None,
+        )
+        if db_option is None:
+            return
+        codsc = db_option["codsc"]
+        compri = db_option["compri"]
+
         # 取得 optdesc
         try:
             cats = repo.get_all_option_categories()
@@ -328,7 +519,10 @@ class LLMAgent:
         except Exception:
             optdesc = optno
 
-        quote_draft.setdefault("selections", {})[optno] = {
+        selection_key = path.removeprefix(f"{PRODUCT_PREFIX}\\")
+        if not quote_draft.get("imported_quote"):
+            selection_key = optno
+        quote_draft.setdefault("selections", {})[selection_key] = {
             "optno": optno,
             "optdesc": optdesc,
             "path": path,

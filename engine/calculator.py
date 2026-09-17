@@ -59,6 +59,28 @@ from config import MARKUP_RATE, TAX_RATE, MAX_DISCOUNT_RATE, PRODUCT_PREFIX
 from database import repository as repo
 
 
+def _quo_rate_to_markup(quo_rate: Optional[float]) -> float:
+    """
+    將 invdoc.quo_rate（報價係數）轉為 calculate_quote 使用的加成率。
+
+    語意：quo_rate 為「報價係數」，直接與成本相乘（如 1.3 表示售價=成本×1.3）。
+    calculate_quote 內部公式為 unit_cost × (1 + markup_rate)，
+    因此 markup_rate = quo_rate - 1（quo_rate=1 → markup=0；quo_rate=1.3 → markup=0.3）。
+
+    當 quo_rate 為 None（invdoc.quo_rate 為 NULL）時，
+    fallback 回 config.MARKUP_RATE。
+
+    Args:
+        quo_rate : invdoc.quo_rate（報價係數）；可能為 None
+
+    Returns:
+        float 加成率（供 calculate_quote 的 markup_rate 參數）
+    """
+    if quo_rate is None:
+        return MARKUP_RATE
+    return float(quo_rate) - 1.0
+
+
 # ============================================================
 # 資料結構
 # ============================================================
@@ -329,3 +351,142 @@ def calculate_from_draft(quote_draft: dict) -> CalcResult:
         ))
 
     return calculate_quote(items, discount_rate=discount_rate)
+
+
+# ============================================================
+# 必選項目完整性檢查（以 ordstr.must_chose 為權威來源）
+# ============================================================
+
+def check_required_selections(
+    prodkind: str,
+    selections: dict,
+) -> list[dict]:
+    """
+    以 ordstr 結構樹的必選節點（must_chose='Y'）比對 selections，
+    回傳「缺少的必選節點」清單。
+
+    比對方式：
+        必選節點以 pathc（完整路徑）為主鍵。
+        selections 為 optno 驅動的 dict，其 value 內含 path 欄位。
+        將 selections 已涵蓋的 path 集合取出，
+        任何 must_chose='Y' 但 pathc 不在該集合中的節點即為缺項。
+
+    Args:
+        prodkind   : 產品類別代碼（作為 ordstr 展開根，如 "CMT1"）
+        selections : 報價草稿的 selections dict（以 optno 為 key）
+
+    Returns:
+        list[dict] 缺少的必選節點清單，每筆含 pathc, optnoc, dmark, seq；
+                   若無缺項回傳空清單
+    """
+    required = repo.get_required_nodes(prodkind)
+    if not required:
+        return []
+
+    chosen_paths = {
+        str(sel.get("path", "")).strip()
+        for sel in selections.values()
+    }
+
+    missing: list[dict] = []
+    for node in required:
+        pathc = str(node.get("pathc", "")).strip()
+        if pathc and pathc not in chosen_paths:
+            missing.append({
+                "pathc": pathc,
+                "optnoc": node.get("optnoc", ""),
+                "dmark": node.get("dmark"),
+                "seq": node.get("seq"),
+            })
+    return missing
+
+
+# ============================================================
+# 以 ordstr 結構樹計價（改善後流程）
+# ============================================================
+
+def calculate_from_ordstr(
+    prodkind: str,
+    selections: dict,
+    qty: float = 1.0,
+    discount_rate: float = 0.0,
+) -> CalcResult:
+    """
+    以 ordstr 結構樹為權威來源計算報價（改善後流程）。
+
+    流程：
+        1. 以 repo.expand_ordstr_tree(prodkind) 展開整棵結構樹。
+        2. 對每個葉節點（is_leaf=True，計價候選）：
+             - 成本 compri 回 ordspe 查（get_option_price）。
+             - 用量 stdqty 回 ordqty 查（get_part_quantity，
+               沿用 _get_driver_code 的驅動根節點代碼規則）。
+        3. 加成率改用 invdoc.quo_rate（報價係數，直接相乘）；
+           若 invdoc 查無資料或 quo_rate 為 NULL，fallback config.MARKUP_RATE。
+
+    葉節點所選代碼取得規則：
+        selections 以 optno 為 key，其 value 內含 code。
+        以葉節點 optnoc 對應 selections[optnoc]["code"] 取得使用者選擇；
+        若無對應，退回葉節點自身 optnoc 作為 ordspe 查詢代碼。
+
+    Args:
+        prodkind      : 產品類別代碼（ordstr 展開根，如 "CMT1"）
+        selections    : 報價草稿 selections dict（以 optno 為 key）
+        qty           : 訂購數量
+        discount_rate : 折扣率
+
+    Returns:
+        CalcResult 完整計算結果
+    """
+    prefix = prodkind
+
+    # ── 取得加成率（invdoc.quo_rate 報價係數，fallback MARKUP_RATE） ──
+    category = repo.get_product_category(prodkind)
+    quo_rate = category.get("quo_rate") if category else None
+    markup = _quo_rate_to_markup(quo_rate)
+
+    # ── 展開結構樹，取葉節點作為計價候選 ─────────────────────────
+    tree = repo.expand_ordstr_tree(prodkind)
+    leaf_nodes = [n for n in tree if n.get("is_leaf")]
+
+    items: list[QuoteItem] = []
+
+    for node in leaf_nodes:
+        path = str(node.get("pathc", "")).strip()
+        optnoc = str(node.get("optnoc", "")).strip()
+
+        # 葉節點對應的使用者選擇（以 optnoc 對 selections key）
+        sel = selections.get(optnoc, {})
+        code = str(sel.get("code", "")).strip()
+        codsc = str(sel.get("codsc", "")).strip()
+        optdesc = str(sel.get("optdesc", "")).strip()
+
+        # ordspe 查成本：優先用使用者選的 code，否則退回葉節點自身 optnoc
+        lookup_ordspe_code = code if code else optnoc
+        compri = repo.get_option_price(path=path, code=lookup_ordspe_code)
+
+        # 無成本的結構節點略過
+        if compri == 0.0:
+            continue
+
+        # ordqty 查用量：沿用驅動根節點代碼規則
+        driver_code = _get_driver_code(path, selections, prefix=prefix)
+        lookup_qty_code = driver_code if driver_code else lookup_ordspe_code
+        qty_rule = repo.get_part_quantity(path=path, code=lookup_qty_code)
+        stdqty = qty_rule["stdqty"] if qty_rule else 1.0
+        stdpar = qty_rule["stdpar"] if qty_rule else 1.0
+
+        items.append(QuoteItem(
+            part_code=lookup_ordspe_code,
+            part_desc=codsc,
+            path=path,
+            spc_code=lookup_ordspe_code,
+            spdsc=codsc,
+            qty=qty,
+            stdqty=stdqty,
+            stdpar=stdpar,
+            compri=compri,
+            optno=optnoc,
+            optdesc=optdesc,
+        ))
+
+    return calculate_quote(items, discount_rate=discount_rate, markup_rate=markup)

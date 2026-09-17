@@ -15,7 +15,8 @@ import streamlit as st
 
 from agent.core import run_quote_agent
 from agent.state import QuoteStatus, new_quote_draft, STATUS_LABEL
-from agent.tools import create_quote
+from agent.tools import create_quote, preview_quote
+from agent.quotation_importer import import_pasted_quote, quotation_to_natural_language
 from database.seed_data import seed
 from utils.helpers import (
     calc_items_to_df,
@@ -104,6 +105,41 @@ left_col, right_col = st.columns([1, 1], gap="large")
 
 with left_col:
     st.subheader("💬 需求對話")
+
+    # ── 完整報價單貼上匯入 ─────────────────────────────────
+    with st.expander("📥 貼上完整報價單（13 欄 TSV）", expanded=False):
+        st.caption(
+            "欄位順序：事業別、報價單號、path、狀態、代碼、規格、"
+            "數量、標準用量、來源成本、日期、時間、使用者、來源。"
+            "匯入成本僅作參考，正式試算會重新查詢資料庫。"
+        )
+        pasted_quote = st.text_area(
+            "貼上報價明細",
+            height=220,
+            key="pasted_quote_text",
+            placeholder="103\tQU26824010-01001\tCMT1\\A001\t1\tC005\t60*180\t1.0\t1.0\t0.0\t2026.08.24\t16:07:34\thou\torda60",
+        )
+        if st.button("匯入並重新試算", use_container_width=True):
+            try:
+                imported = import_pasted_quote(pasted_quote)
+                draft = imported.draft
+                preview = preview_quote(draft)
+                draft["calc_result"] = preview["calc"]
+                draft["imported_quote"]["source_total_rows"] = len(imported.rows)
+                st.session_state.current_quote = draft
+                st.session_state.quote_confirmed = False
+                natural_request = quotation_to_natural_language(imported.rows)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"已將報價單轉成自然語句：\n\n{natural_request}\n\n"
+                    f"已匯入 {len(imported.rows)} 筆，並使用目前資料庫重新試算。",
+                })
+                st.success(f"已匯入 {len(imported.rows)} 筆明細並完成試算。")
+                for warning in draft["imported_quote"].get("warnings", []):
+                    st.warning(warning)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"匯入失敗：{exc}")
 
     # 渲染歷史訊息
     chat_container = st.container(height=480, border=True)
@@ -211,6 +247,19 @@ with right_col:
         st.stop()
 
     # ── 規格摘要卡片（動態渲染 selections） ───────────────
+    imported_info = quote_data.get("imported_quote")
+    if imported_info:
+        st.info(
+            f"📥 來源報價單：{imported_info.get('source_ref_no', '--')}｜"
+            f"已匯入 {imported_info.get('source_total_rows', len(imported_info.get('source_rows', [])))} 筆；"
+            "下方金額為目前資料庫重新試算結果。"
+        )
+        source_warnings = imported_info.get("warnings", [])
+        if source_warnings:
+            with st.expander(f"⚠️ 匯入警告（{len(source_warnings)}）"):
+                for warning in source_warnings:
+                    st.write(f"- {warning}")
+
     with st.container(border=True):
         col1, col2 = st.columns(2)
 

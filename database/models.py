@@ -1,10 +1,12 @@
 """
 database/models.py - ORM 資料模型定義
 
-依設計文件欄位定義以下四張資料表：
+依設計文件欄位定義以下資料表：
   - Ordspd  : 選項定義檔
   - Ordspe  : 可選項目檔（含採購單價）
   - Ordqty  : 產品部位用量檔（BOM 用量規則）
+  - Invdoc  : 產品類別主檔（ordkind=1 為報價產品類別）
+  - Ordstr  : 產品結構／必選項目樹（父子鄰接邊表）
   - ordqdt_ai  : 報價規格明細檔（快照，建議新增）
 
 主要設計原則：
@@ -18,7 +20,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import String, Float, Text, UniqueConstraint
+from sqlalchemy import String, Float, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database.connection import Base
@@ -130,6 +132,91 @@ class Ordqty(Base):
         return (
             f"<Ordqty path={self.path!r} code={self.code!r} "
             f"stdqty={self.stdqty} stdpar={self.stdpar}>"
+        )
+
+
+# ============================================================
+# invdoc — 產品類別主檔（ordkind=1 為報價產品類別）
+# PK: (workgroup, prodkind)
+# ============================================================
+
+class Invdoc(Base):
+    """
+    產品類別主檔。
+    以 ordkind=1 篩選出可報價的產品類別，
+    prodkind 為產品類別代碼（對應 ordstr.pathf / ordspe.path 前綴，如 CMT1），
+    codsc 為產品類別名稱，quo_rate 為該類別的報價率（加成率）。
+    """
+    __tablename__ = "invdoc"
+
+    # --- PK ---
+    workgroup: Mapped[str] = mapped_column(String(3), primary_key=True, comment="事業別")
+    prodkind: Mapped[str] = mapped_column(String(12), primary_key=True, comment="產品類別代碼（如 CMT1）")
+
+    # --- 資料欄位 ---
+    codsc: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, comment="產品類別名稱")
+    ordkind: Mapped[Optional[str]] = mapped_column(String(1), nullable=True, comment="類別種類（報價產品=1）")
+    quo_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True, comment="報價率／加成率")
+
+    # --- 稽核欄位 ---
+    adddate: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="建立日期")
+    addusrno: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, comment="建立人員")
+    abndat: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="異動日期")
+    abntim: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, comment="異動時間")
+    usrno: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, comment="異動人員")
+    prgno: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="異動程式")
+
+    def __repr__(self) -> str:
+        return (
+            f"<Invdoc prodkind={self.prodkind!r} codsc={self.codsc!r} "
+            f"quo_rate={self.quo_rate}>"
+        )
+
+
+# ============================================================
+# ordstr — 產品結構／必選項目樹（父子鄰接邊表）
+# PK: (workgroup, pathf, pathc)
+# ============================================================
+
+class Ordstr(Base):
+    """
+    產品結構樹（adjacency list）。
+    每一列代表一條「父 pathf → 子 pathc」的邊。
+    must_chose 標記子節點是否為必選項目；seq 為同一父節點下的顯示順序。
+    需以 pathf 遞迴查詢以展開整棵結構樹。
+
+    父階層（結構節點）本身無成本；葉節點（不再作為 pathf）為計價候選，
+    成本來自 ordspe.compri、用量來自 ordqty.stdqty。
+    有成本的子項目可能位於 2 階以上（如 CMT1\\A001\\S050\\S005\\S008）。
+    """
+    __tablename__ = "ordstr"
+
+    # --- PK ---
+    workgroup: Mapped[str] = mapped_column(String(3), primary_key=True, comment="事業別")
+    pathf: Mapped[str] = mapped_column(String(100), primary_key=True, comment="父節點路徑")
+    pathc: Mapped[str] = mapped_column(String(100), primary_key=True, comment="子節點路徑")
+
+    # --- 資料欄位 ---
+    optnof: Mapped[str] = mapped_column(String(10), nullable=False, comment="父節點選項代碼")
+    optnoc: Mapped[str] = mapped_column(String(10), nullable=False, comment="子節點選項代碼")
+    must_chose: Mapped[Optional[str]] = mapped_column(String(1), nullable=True, comment="是否必選（Y/N）")
+    has_name: Mapped[Optional[str]] = mapped_column(String(1), nullable=True, comment="是否有名稱")
+    has_inname: Mapped[Optional[str]] = mapped_column(String(1), nullable=True, comment="是否有內部名稱")
+    seq: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, comment="顯示順序")
+    dmark: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="備註／說明")
+
+    # --- 稽核欄位 ---
+    adddate: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="建立日期")
+    addusrno: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, comment="建立人員")
+    usrno: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, comment="異動人員")
+    prgno: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="異動程式")
+    abndat: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, comment="異動日期")
+    abntim: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, comment="異動時間")
+
+    def __repr__(self) -> str:
+        return (
+            f"<Ordstr pathf={self.pathf!r} pathc={self.pathc!r} "
+            f"must_chose={self.must_chose!r} seq={self.seq}>"
         )
 
 

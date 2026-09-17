@@ -88,17 +88,20 @@ def build_snapshot_items(
     today = datetime.date.today().strftime("%Y-%m-%d")
     selections: dict = quote_draft.get("selections", {})
 
-    # 建立 spc_code → 選項說明的對映（供快照備用）
-    sel_map: dict[str, dict] = {
-        v.get("code", ""): v for v in selections.values()
-    }
-
     snapshot_items: list[dict] = []
 
     for idx, item in enumerate(calc_result.items, start=1):
         seq_no = f"{idx:05d}"
         spc_code = item.get("spc_code", "")
-        sel_info = sel_map.get(spc_code, {})
+        # 同一個 code 可能出現在不同 path；必須以 path + code 找回選項。
+        sel_info = next(
+            (
+                value for value in selections.values()
+                if value.get("path") == item.get("path")
+                and value.get("code") == spc_code
+            ),
+            {},
+        )
 
         snapshot_items.append({
             "workgroup": workgroup,
@@ -107,7 +110,7 @@ def build_snapshot_items(
             "part_code": item.get("part_code", ""),
             "part_desc": item.get("part_desc", ""),
             "path": item.get("path", ""),
-            "opt_code": sel_info.get("opt_code", ""),
+            "opt_code": sel_info.get("opt_code") or sel_info.get("code", ""),
             "opt_desc": sel_info.get("optdesc", ""),
             "spc_code": spc_code,
             "spdsc": item.get("spdsc", ""),

@@ -28,14 +28,16 @@ UI、AI Agent 與計價引擎均不得直接執行 SQL，只能呼叫此模組�
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
+
 from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from database.connection import get_db
-from database.models import Ordspd, Ordspe, Ordqty, ordqdt_ai
-from config import WORKGROUP, PRODUCT_PREFIX
+from database.models import Ordspd, Ordspe, Ordqty, Invdoc, Ordstr, ordqdt_ai
+from config import WORKGROUP, PRODUCT_PREFIX, ORDKIND_PRODUCT
 
 
 # ============================================================
@@ -199,6 +201,55 @@ def search_option(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
             }
             for r in rows
         ]
+    finally:
+        db.close()
+
+
+def search_option_fuzzy(
+    keyword: str,
+    path_prefix: str | None = None,
+    workgroup: str = WORKGROUP,
+    limit: int = 8,
+) -> list[dict]:
+    """以資料庫選項為全集，依文字相似度回傳候選，不自行產生規格。"""
+    def normalize(value: str) -> str:
+        return "".join(value.lower().split()).replace("×", "x").replace("＊", "*")
+
+    query = normalize(keyword)
+    if not query:
+        return []
+
+    db = _session()
+    try:
+        query_obj = db.query(Ordspe).filter(Ordspe.workgroup == workgroup)
+        if path_prefix:
+            # 模糊候選只搜尋目前選項節點，避免把子路徑或其他部件混入候選。
+            query_obj = query_obj.filter(Ordspe.path == path_prefix)
+        rows = query_obj.all()
+        candidates: list[dict] = []
+        for row in rows:
+            path = (row.path or "").strip()
+            code = (row.code or "").strip()
+            codsc = (row.codsc or "").strip()
+            values = [normalize(codsc), normalize(code)]
+            score = max(
+                SequenceMatcher(None, query, value).ratio()
+                for value in values
+                if value
+            )
+            if any(query in value for value in values if value):
+                score = max(score, 0.9)
+            candidates.append({
+                "path": path,
+                "code": code,
+                "codsc": codsc,
+                "compri": row.compri or 0.0,
+                "optno": optno_from_path(path),
+                "match_score": round(score, 4),
+                "match_type": "fuzzy",
+            })
+        candidates.sort(key=lambda item: (-item["match_score"], item["path"], item["code"]))
+        return candidates[:limit]
     finally:
         db.close()
 
@@ -471,3 +522,215 @@ def get_all_option_categories(workgroup: str = WORKGROUP) -> list[dict]:
         ]
     finally:
         db.close()
+
+
+# ============================================================
+# 10. get_product_categories - 取得產品類別清單（invdoc）
+# ============================================================
+
+def get_product_categories(
+    ordkind: str = ORDKIND_PRODUCT,
+    workgroup: str = WORKGROUP,
+) -> list[dict]:
+    """
+    取得 invdoc 中指定 ordkind 的產品類別清單。
+
+    Args:
+        ordkind   : 類別種類（預設 ORDKIND_PRODUCT="1" 報價產品）
+        workgroup : 事業別
+
+    Returns:
+        list[dict] 每筆含 prodkind, codsc, quo_rate, ordkind
+    """
+    db = _session()
+    try:
+        rows = (
+            db.query(Invdoc)
+            .filter(
+                Invdoc.workgroup == workgroup,
+                Invdoc.ordkind == ordkind,
+            )
+            .order_by(Invdoc.prodkind)
+            .all()
+        )
+        return [
+            {
+                "prodkind": (r.prodkind or "").strip(),
+                "codsc": (r.codsc or "").strip() if r.codsc else None,
+                "quo_rate": r.quo_rate,
+                "ordkind": (r.ordkind or "").strip() if r.ordkind else None,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+# ============================================================
+# 11. get_product_category - 依 prodkind 取得單一產品類別
+# ============================================================
+
+def get_product_category(
+    prodkind: str,
+    workgroup: str = WORKGROUP,
+) -> Optional[dict]:
+    """
+    依 prodkind 取得單一產品類別（含 quo_rate）。
+
+    Args:
+        prodkind  : 產品類別代碼（如 "CMT1"）
+        workgroup : 事業別
+
+    Returns:
+        dict 含 prodkind, codsc, quo_rate, ordkind；若不存在回傳 None
+    """
+    db = _session()
+    try:
+        row = (
+            db.query(Invdoc)
+            .filter(
+                Invdoc.workgroup == workgroup,
+                Invdoc.prodkind == prodkind,
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        return {
+            "prodkind": (row.prodkind or "").strip(),
+            "codsc": (row.codsc or "").strip() if row.codsc else None,
+            "quo_rate": row.quo_rate,
+            "ordkind": (row.ordkind or "").strip() if row.ordkind else None,
+        }
+    finally:
+        db.close()
+
+
+# ============================================================
+# 12. get_ordstr_children - 取得某父節點的直接子節點（ordstr）
+# ============================================================
+
+def get_ordstr_children(
+    pathf: str,
+    workgroup: str = WORKGROUP,
+) -> list[dict]:
+    """
+    取得某父節點 pathf 的直接子節點（依 seq 排序）。
+
+    Args:
+        pathf     : 父節點路徑（如 "CMT1" 或 "CMT1\\A001"）
+        workgroup : 事業別
+
+    Returns:
+        list[dict] 每筆含 pathf, pathc, optnof, optnoc,
+                   must_chose, has_name, has_inname, seq, dmark
+    """
+    db = _session()
+    try:
+        rows = (
+            db.query(Ordstr)
+            .filter(
+                Ordstr.workgroup == workgroup,
+                Ordstr.pathf == pathf,
+            )
+            .order_by(Ordstr.seq)
+            .all()
+        )
+        return [
+            {
+                "pathf": (r.pathf or "").strip(),
+                "pathc": (r.pathc or "").strip(),
+                "optnof": (r.optnof or "").strip(),
+                "optnoc": (r.optnoc or "").strip(),
+                "must_chose": (r.must_chose or "").strip() if r.must_chose else None,
+                "has_name": (r.has_name or "").strip() if r.has_name else None,
+                "has_inname": (r.has_inname or "").strip() if r.has_inname else None,
+                "seq": r.seq,
+                "dmark": r.dmark,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+# ============================================================
+# 13. expand_ordstr_tree - 遞迴展開整棵結構樹（ordstr）
+# ============================================================
+
+def expand_ordstr_tree(
+    root_path: str,
+    workgroup: str = WORKGROUP,
+) -> list[dict]:
+    """
+    以 root_path 為根，遞迴展開整棵結構樹（DFS，依 seq 排序）。
+
+    每個節點標註：
+        depth      : 相對於根的深度（root 的直接子節點 depth=1）
+        is_leaf    : 是否為葉節點（不再作為 pathf）
+        must_chose : 是否必選（Y/空）
+
+    葉節點（不再作為 pathf）視為計價候選，
+    需再回 ordspe 取成本、回 ordqty 取用量。
+
+    遞迴保護：以 visited set 記錄已展開的 pathc，
+    避免資料異常（循環邊）造成無限遞迴。
+
+    Args:
+        root_path : 結構樹根路徑，通常為 prodkind（如 "CMT1"）
+        workgroup : 事業別
+
+    Returns:
+        list[dict] 扁平化的節點清單（保留 depth/is_leaf/must_chose 等階層資訊）
+    """
+    result: list[dict] = []
+    visited: set[str] = set()
+
+    def _walk(pathf: str, depth: int) -> None:
+        if pathf in visited:
+            return
+        visited.add(pathf)
+
+        children = get_ordstr_children(pathf, workgroup=workgroup)
+        for child in children:
+            pathc = child["pathc"]
+            grandchildren = get_ordstr_children(pathc, workgroup=workgroup)
+            is_leaf = len(grandchildren) == 0
+            result.append({
+                "pathf": child["pathf"],
+                "pathc": pathc,
+                "optnof": child["optnof"],
+                "optnoc": child["optnoc"],
+                "must_chose": child["must_chose"],
+                "seq": child["seq"],
+                "dmark": child["dmark"],
+                "depth": depth,
+                "is_leaf": is_leaf,
+            })
+            if not is_leaf:
+                _walk(pathc, depth + 1)
+
+    _walk(root_path, 1)
+    return result
+
+
+# ============================================================
+# 14. get_required_nodes - 取得必選節點清單（ordstr.must_chose）
+# ============================================================
+
+def get_required_nodes(
+    root_path: str,
+    workgroup: str = WORKGROUP,
+) -> list[dict]:
+    """
+    回傳整棵樹中 must_chose='Y' 的必選節點清單（供完整性檢查）。
+
+    Args:
+        root_path : 結構樹根路徑，通常為 prodkind（如 "CMT1"）
+        workgroup : 事業別
+
+    Returns:
+        list[dict] 每筆含 pathf, pathc, optnoc, must_chose, seq, dmark, depth, is_leaf
+    """
+    nodes = expand_ordstr_tree(root_path, workgroup=workgroup)
+    return [n for n in nodes if (n.get("must_chose") or "").upper() == "Y"]

@@ -129,6 +129,10 @@ def _lookup_option_by_optno(keyword: str, optno: str) -> Optional[dict]:
     target_path = repo.build_option_path(optno)
     results = repo.search_option(keyword=keyword, workgroup=WORKGROUP)
     filtered = [r for r in results if r.get("path", "") == target_path]
+    if not filtered:
+        filtered = repo.search_option_fuzzy(
+            keyword=keyword, path_prefix=target_path, workgroup=WORKGROUP, limit=5
+        )
     if filtered:
         r = filtered[0]
         # 取得 optdesc
@@ -141,6 +145,7 @@ def _lookup_option_by_optno(keyword: str, optno: str) -> Optional[dict]:
             "code": r["code"],
             "codsc": r["codsc"],
             "compri": r["compri"],
+            "requires_confirmation": r.get("match_type") == "fuzzy",
         }
     return None
 
@@ -156,6 +161,10 @@ def _lookup_option_by_path_prefix(keyword: str, path_prefix: str) -> Optional[di
     results = repo.search_option(keyword=keyword, workgroup=WORKGROUP)
     prefix = f"{PRODUCT_PREFIX}\\{path_prefix}" if not path_prefix.startswith(PRODUCT_PREFIX) else path_prefix
     filtered = [r for r in results if r.get("path", "").startswith(prefix)]
+    if not filtered:
+        filtered = repo.search_option_fuzzy(
+            keyword=keyword, path_prefix=prefix, workgroup=WORKGROUP, limit=5
+        )
     if filtered:
         r = filtered[0]
         optno = r.get("optno", repo.optno_from_path(r["path"]))
@@ -168,6 +177,7 @@ def _lookup_option_by_path_prefix(keyword: str, path_prefix: str) -> Optional[di
             "code": r["code"],
             "codsc": r["codsc"],
             "compri": r["compri"],
+            "requires_confirmation": r.get("match_type") == "fuzzy",
         }
     return None
 
@@ -187,6 +197,9 @@ def extract_size(text: str) -> Optional[dict]:
     # 匹配 WxH 格式（支援 cm 格式如 60*120 或 mm 格式如 1200x600）
     m = re.search(r"(\d{2,4})\s*[xX×*]\s*(\d{2,4})", text)
     if not m:
+        vague_size_words = ("比較大", "大一點", "大桌", "桌面", "尺寸", "寬敞")
+        if any(word in text for word in vague_size_words):
+            return _fuzzy_selection(text, f"{PRODUCT_PREFIX}\\A001", "A001", "桌面尺寸")
         return None
 
     w_raw, h_raw = m.group(1), m.group(2)
@@ -201,7 +214,33 @@ def extract_size(text: str) -> Optional[dict]:
         if result:
             return result
 
-    return None
+    return _fuzzy_selection(text, f"{PRODUCT_PREFIX}\\A001", "A001", "桌面尺寸")
+
+
+def _fuzzy_selection(text: str, path: str, optno: str, optdesc: str) -> Optional[dict]:
+    """將模糊描述轉成資料庫候選，不直接認定為使用者最終選擇。"""
+    candidates = repo.search_option_fuzzy(
+        keyword=text, path_prefix=path, workgroup=WORKGROUP, limit=8
+    )
+    if not candidates:
+        return None
+    if optno == "A001" and any(word in text for word in ("大", "寬", "長")):
+        candidates.sort(key=lambda item: _size_area(item.get("codsc", "")), reverse=True)
+    elif optno == "A001" and any(word in text for word in ("小", "窄", "短")):
+        candidates.sort(key=lambda item: _size_area(item.get("codsc", "")))
+    for candidate in candidates:
+        candidate["optno"] = optno
+        candidate["optdesc"] = optdesc
+    selected = dict(candidates[0])
+    selected["candidate_options"] = candidates
+    selected["requires_confirmation"] = True
+    return selected
+
+
+def _size_area(value: str) -> int:
+    """從資料庫尺寸文字取得排序依據；無法解析時排在最後。"""
+    numbers = [int(number) for number in re.findall(r"\d+", value)]
+    return numbers[0] * numbers[1] if len(numbers) >= 2 else -1
 
 
 # ============================================================
@@ -218,6 +257,11 @@ def extract_board(text: str) -> Optional[dict]:
         if kw in text:
             results = repo.search_option(keyword=search_kw, workgroup=WORKGROUP)
             filtered = [r for r in results if r.get("path", "") == board_path_prefix]
+            if not filtered:
+                filtered = repo.search_option_fuzzy(
+                    keyword=search_kw, path_prefix=board_path_prefix,
+                    workgroup=WORKGROUP, limit=5,
+                )
             if filtered:
                 r = filtered[0]
                 return {
@@ -227,7 +271,10 @@ def extract_board(text: str) -> Optional[dict]:
                     "code": r["code"],
                     "codsc": r["codsc"],
                     "compri": r["compri"],
+                    "requires_confirmation": r.get("match_type") == "fuzzy",
                 }
+    if any(word in text for word in ("板", "桌面材質", "材質")):
+        return _fuzzy_selection(text, board_path_prefix, "S004", "板材")
     return None
 
 
@@ -245,6 +292,11 @@ def extract_color(text: str) -> Optional[dict]:
         if kw in text:
             results = repo.search_option(keyword=search_kw, workgroup=WORKGROUP)
             filtered = [r for r in results if r.get("path", "") == color_path_prefix]
+            if not filtered:
+                filtered = repo.search_option_fuzzy(
+                    keyword=search_kw, path_prefix=color_path_prefix,
+                    workgroup=WORKGROUP, limit=5,
+                )
             if filtered:
                 r = filtered[0]
                 return {
@@ -254,7 +306,10 @@ def extract_color(text: str) -> Optional[dict]:
                     "code": r["code"],
                     "codsc": r["codsc"],
                     "compri": r["compri"],
+                    "requires_confirmation": r.get("match_type") == "fuzzy",
                 }
+    if any(word in text for word in ("顏色", "色紙", "顏色材質")):
+        return _fuzzy_selection(text, color_path_prefix, "S001", "色紙")
     return None
 
 
@@ -272,6 +327,11 @@ def extract_leg(text: str) -> Optional[dict]:
         if kw in text:
             results = repo.search_option(keyword=search_kw, workgroup=WORKGROUP)
             filtered = [r for r in results if r.get("path", "") == leg_path]
+            if not filtered:
+                filtered = repo.search_option_fuzzy(
+                    keyword=search_kw, path_prefix=leg_path,
+                    workgroup=WORKGROUP, limit=5,
+                )
             if filtered:
                 r = filtered[0]
                 cats = repo.get_all_option_categories()
@@ -283,7 +343,10 @@ def extract_leg(text: str) -> Optional[dict]:
                     "code": r["code"],
                     "codsc": r["codsc"],
                     "compri": r["compri"],
+                    "requires_confirmation": r.get("match_type") == "fuzzy",
                 }
+    if any(word in text for word in ("腳", "腳架", "桌腳")):
+        return _fuzzy_selection(text, leg_path, "B001", "木腳")
     return None
 
 
@@ -322,6 +385,24 @@ def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str
     """
     found: list[str] = []
 
+    def store_selection(selection: Optional[dict]) -> None:
+        if not selection:
+            return
+        candidates = selection.pop("candidate_options", None)
+        if candidates:
+            quote_draft.setdefault("pending_options", []).extend(candidates)
+            return
+        if selection.pop("requires_confirmation", False):
+            quote_draft.setdefault("pending_options", []).append(selection)
+            return
+        # 匯入完整報價單後，必須以相對 path 區分不同產品樹下同名 optno，
+        # 例如 A001\S004 與 B001\S004；一般自然語言草稿仍維持根節點 optno。
+        if quote_draft.get("imported_quote"):
+            key = selection.get("path", "").removeprefix(f"{PRODUCT_PREFIX}\\")
+        else:
+            key = selection["optno"]
+        quote_draft.setdefault("selections", {})[key] = selection
+
     # 數量
     qty = extract_quantity(user_input)
     if qty is not None:
@@ -331,25 +412,25 @@ def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str
     # 尺寸（A001）
     size = extract_size(user_input)
     if size:
-        quote_draft.setdefault("selections", {})[size["optno"]] = size
+        store_selection(size)
         found.append(f"桌面尺寸：{size['codsc']}")
 
     # 板材（S004，CMT1\\A001\\S004）
     board = extract_board(user_input)
     if board:
-        quote_draft.setdefault("selections", {})[board["optno"]] = board
+        store_selection(board)
         found.append(f"板材：{board['codsc']}")
 
     # 色紙（S001，CMT1\\A001\\S005\\S001）
     color = extract_color(user_input)
     if color:
-        quote_draft.setdefault("selections", {})[color["optno"]] = color
+        store_selection(color)
         found.append(f"色紙：{color['codsc']}")
 
     # 腳架（B001 / B002）
     leg = extract_leg(user_input)
     if leg:
-        quote_draft.setdefault("selections", {})[leg["optno"]] = leg
+        store_selection(leg)
         found.append(f"腳架：{leg['codsc']}")
 
     return quote_draft, found
@@ -359,7 +440,11 @@ def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str
 # 產生缺項提示文字
 # ============================================================
 
-def format_missing_prompt(missing_fields: list[str], current_draft: dict) -> str:
+def format_missing_prompt(
+    missing_fields: list[str],
+    current_draft: dict,
+    missing_options: Optional[dict[str, list[dict]]] = None,
+) -> str:
     """
     依缺少的欄位清單產生詢問提示。
 
@@ -387,7 +472,50 @@ def format_missing_prompt(missing_fields: list[str], current_draft: dict) -> str
         lines.append("⚠️ 還缺少以下資訊：")
         for i, f in enumerate(missing_fields, start=1):
             lines.append(f"  {i}. {f}")
+
+        # 選項必須由資料庫提供；此處不接受 LLM 自行產生的內容。
+        if missing_options:
+            lines.append("")
+            lines.append("請從以下資料庫可用規格中選擇：")
+            for optno, options in missing_options.items():
+                if not options:
+                    lines.append(f"  {optno}：資料庫目前沒有可用選項")
+                    continue
+                for i, option in enumerate(options, start=1):
+                    lines.append(
+                        f"  {optno} - {i}. {option.get('codsc', '')}"
+                        f"（代碼：{option.get('code', '')}）"
+                    )
         lines.append("")
         lines.append("請繼續補充，或回覆「使用標準規格」套用預設值。")
 
     return "\n".join(lines)
+
+
+def format_candidate_confirmation(candidates: list[dict], prompt: str = "") -> str:
+    """顯示模糊候選；所有名稱與代碼直接使用資料庫回傳值。"""
+    lines = [prompt or "我找到以下最接近的資料庫規格，請確認要套用哪一個："]
+    for index, candidate in enumerate(candidates, start=1):
+        lines.append(
+            f"  {index}. {candidate.get('codsc', '')} "
+            f"（代碼：{candidate.get('code', '')}，路徑：{candidate.get('path', '')}）"
+        )
+    lines.append("請回覆選項編號或代碼確認，也可以提供其他描述重新搜尋。")
+    return "\n".join(lines)
+
+
+def select_candidate(text: str, candidates: list[dict]) -> Optional[dict]:
+    """依編號、資料庫代碼或「確認」選取候選。"""
+    value = text.strip()
+    match = re.search(r"(?:第\s*)?(\d+)\s*(?:個|項|號)?", value)
+    if match:
+        index = int(match.group(1)) - 1
+        if 0 <= index < len(candidates):
+            return candidates[index]
+    for candidate in candidates:
+        code = str(candidate.get("code", ""))
+        if code and code.lower() in value.lower():
+            return candidate
+    if is_confirm(value) and candidates:
+        return candidates[0]
+    return None

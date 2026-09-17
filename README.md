@@ -195,6 +195,8 @@ ai_quote_assistant/
 
 | 資料表 | 用途 | 核心角色 |
 |---|---|---|
+| `invdoc` | 產品類別主檔 | 定義「有哪些可報價的產品類別（ordkind=1）、報價率（quo_rate）」 |
+| `ordstr` | 產品結構／必選項目樹 | 以父子鄰接邊（pathf→pathc）定義結構樹與必選項目（must_chose） |
 | `ordspd` | 選項定義檔 | 定義「有哪些選項類別」（如 A001 尺寸、S002 材質、B001 腳架） |
 | `ordspe` | 可選項目檔 | 定義「某選項底下有哪些項目、採購成本（compri）」 |
 | `ordqty` | 產品部位用量檔 | 定義「某項目／部位需要多少標準用量（stdqty）」；`codsc` 欄位在真實 DB 為 NULL |
@@ -524,8 +526,8 @@ Streamlit UI → database/ 查詢 → Agent 與 Tool Calling
 
 以下為尚未完全確認、需視實際 ERP 環境調整的項目：
 
-- **`REQUIRED_OPTNOS` 設定**：目前預設 `["A001"]`（尺寸為必填），其餘 S002/B001 為選填（有預設值）。實際部署時請根據業務規則調整。
-- **加成率與稅率來源**：目前 `markup_rate=1.30`、`tax_rate=1.05` 硬編碼於 `config.py`；生產環境建議從 ERP 主檔取得。
+- **必選項目來源**：權威來源為 `ordstr.must_chose='Y'`（透過 [`repository.get_required_nodes()`](database/repository.py) 取得）；當 `ordstr` 尚無資料時，回退至 `config.REQUIRED_OPTNOS`（fallback，目前預設 `["A001"]`）。實際部署時請根據業務規則調整。
+- **加成率（報價係數）來源**：權威來源為 `invdoc.quo_rate`（報價係數，直接相乘，例如 1.3；`markup_rate = quo_rate - 1.0`）；當 `invdoc` 無資料時回退至 `config.MARKUP_RATE`（fallback，預設 `1.30`）。稅率 `tax_rate=1.05` 仍暫存於 `config.py`，生產環境建議從 ERP 主檔取得。
 - **`ordqty.codsc` 欄位**：真實資料庫中此欄位為 NULL，已在 `models.py` 移除 PK 並設為 `nullable=True`。若未來資料庫補齊此欄位，可視需要重新加入查詢條件。
 - **`ref_no` 報價單號編號規則**：目前依 `WORKGROUP` + 日期 + 流水號產生；如 ERP 有其他規則請調整 [`engine/snapshot.py`](engine/snapshot.py)。
 - **`ordspd` / `ordspe` / `ordqty` 之間是否存在正式 Foreign Key**：目前依賴 `path` 字串關聯，無 DB 層 FK 約束。
@@ -538,7 +540,8 @@ Streamlit UI → database/ 查詢 → Agent 與 Tool Calling
 
 - [`docs/AI報價助理系統_開發設計規格.md`](docs/AI報價助理系統_開發設計規格.md) — 系統目標、核心原則、Tool 設計、報價流程
 - [`docs/AI 報價助理系統－全 Python（Streamlit）本機架構設計書.md`](docs/AI%20報價助理系統－全%20Python（Streamlit）本機架構設計書.md) — 全 Python 架構、目錄、模組職責、啟動方式
-- [`docs/報價訂單資料庫結構與關聯設計.md`](docs/報價訂單資料庫結構與關聯設計.md) — 資料表結構、關聯、SQL 與快照設計
+- [`docs/報價訂單資料庫結構與關聯設計.md`](docs/報價訂單資料庫結構與關聯設計.md) — 資料表結構、關聯、SQL 與快照設計（含 `invdoc`、`ordstr`）
+- [`docs/改善後報價流程.md`](docs/改善後報價流程.md) — 以 `ordstr` 結構樹展開、`invdoc.quo_rate` 報價係數的改善後報價流程
 - [`plans/fix-real-data-model-alignment.md`](plans/fix-real-data-model-alignment.md) — 真實資料模型對齊修正紀錄
 
 ---

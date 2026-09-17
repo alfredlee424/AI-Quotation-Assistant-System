@@ -18,7 +18,7 @@ from typing import Any
 
 from database import repository as repo
 from engine.calculator import calculate_from_draft
-from config import WORKGROUP
+from config import WORKGROUP, PRODUCT_PREFIX
 
 
 # ============================================================
@@ -66,7 +66,20 @@ def search_option(keyword: str, workgroup: str = WORKGROUP) -> dict:
         每筆含 path, code, codsc, compri
     """
     results = repo.search_option(keyword=keyword, workgroup=workgroup)
-    return {"results": results, "count": len(results)}
+    if results:
+        for result in results:
+            result["match_type"] = "exact"
+        return {"results": results, "count": len(results), "requires_confirmation": False}
+
+    # SQL LIKE 找不到時，改以資料庫既有選項做相似度候選；候選仍完全來自 DB，
+    # 但不得在使用者確認前寫入報價草稿。
+    results = repo.search_option_fuzzy(keyword=keyword, workgroup=workgroup)
+    return {
+        "results": results,
+        "count": len(results),
+        "requires_confirmation": bool(results),
+        "message": "以下為最接近的資料庫規格，請確認或選擇其他選項。" if results else "資料庫找不到相近規格。",
+    }
 
 
 def get_options_by_path(path: str, workgroup: str = WORKGROUP) -> dict:
@@ -114,6 +127,10 @@ def calculate_quote(quote_draft: dict) -> dict:
     Returns:
         {"total_cost": float, "total_price": float, "items": [...], ...}
     """
+    validation = validate_quote_draft(quote_draft)
+    if not validation["valid"]:
+        raise ValueError("報價規格驗證失敗：" + "；".join(validation["errors"]))
+
     calc = calculate_from_draft(quote_draft)
     return {
         "total_cost": calc.total_cost,
@@ -181,6 +198,10 @@ def create_quote(quote_draft: dict, user: str = "SYS") -> dict:
     from engine.calculator import calculate_from_draft
     from engine.snapshot import create_quote_snapshot
 
+    validation = validate_quote_draft(quote_draft)
+    if not validation["valid"]:
+        raise ValueError("報價規格驗證失敗：" + "；".join(validation["errors"]))
+
     calc = calculate_from_draft(quote_draft)
     ref_no = create_quote_snapshot(calc_result=calc, quote_draft=quote_draft, user=user)
 
@@ -190,6 +211,71 @@ def create_quote(quote_draft: dict, user: str = "SYS") -> dict:
         "total_price": calc.total_price,
         "message": f"已成功建立報價單 {ref_no}，報價金額 ${calc.total_price:,.0f} 元。",
     }
+
+
+def validate_quote_draft(quote_draft: dict) -> dict:
+    """驗證草稿中的每個規格是否仍存在於資料庫白名單。
+
+    必選項目檢查以 ordstr.must_chose 為權威來源（透過
+    engine.calculator.check_required_selections），
+    當 ordstr 查無資料時 fallback 回 config.REQUIRED_OPTNOS。
+    """
+    from config import REQUIRED_OPTNOS
+
+    errors: list[str] = []
+    selections = quote_draft.get("selections", {})
+
+    if not quote_draft.get("qty"):
+        errors.append("缺少數量")
+
+    # ── 必選項目檢查：優先採用 ordstr.must_chose（權威來源） ──
+    prodkind = str(quote_draft.get("prodkind", PRODUCT_PREFIX)).strip() or PRODUCT_PREFIX
+    required_nodes = repo.get_required_nodes(prodkind)
+
+    if required_nodes:
+        # ordstr 有必選節點定義：以結構樹為準
+        from engine.calculator import check_required_selections
+        missing_nodes = check_required_selections(prodkind, selections)
+        for node in missing_nodes:
+            desc = node.get("dmark") or node.get("optnoc") or node.get("pathc")
+            errors.append(f"缺少必選項目：{node.get('pathc')}（{desc}）")
+    else:
+        # fallback：ordstr 無資料時沿用 REQUIRED_OPTNOS
+        missing_optnos = [optno for optno in REQUIRED_OPTNOS if optno not in selections]
+        if missing_optnos:
+            errors.append("缺少必要規格：" + ", ".join(missing_optnos))
+
+    for key, selection in selections.items():
+        path = str(selection.get("path", "")).strip()
+        code = str(selection.get("code", "")).strip()
+        optno = str(selection.get("optno", "")).strip()
+        if not path or not code:
+            errors.append(f"{key} 缺少 path 或 code")
+            continue
+
+        if not path.startswith(f"{PRODUCT_PREFIX}\\"):
+            errors.append(f"{path} 不屬於目前產品 {PRODUCT_PREFIX}")
+            continue
+
+        # 子部件的 selection 會以自身 optno 為識別（例如
+        # CMT1\A001\S004 → S004），不能只取產品路徑下的第一段 A001。
+        path_parts = path.removeprefix(f"{PRODUCT_PREFIX}\\").split("\\")
+        path_optno = path_parts[-1] if path_parts else ""
+        if optno and path_optno and optno != path_optno:
+            errors.append(f"{path} 與 optno {optno} 不一致")
+            continue
+
+        options = repo.get_options_by_path(path)
+        matched = next((item for item in options if item["code"] == code), None)
+        if matched is None:
+            errors.append(f"{path} 不存在規格代碼 {code}")
+            continue
+
+        # 以資料庫內容覆寫可能被 LLM 修改的描述與成本。
+        selection["codsc"] = matched["codsc"]
+        selection["compri"] = matched["compri"]
+
+    return {"valid": not errors, "errors": errors}
 
 
 # ============================================================
