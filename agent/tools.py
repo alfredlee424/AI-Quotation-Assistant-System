@@ -152,184 +152,60 @@ def get_part_quantity(
 
 
 def calculate_quote(quote_draft: dict) -> dict:
-    """
-    依報價草稿計算成本與售價（不寫入資料庫）。
-
-    Args:
-        quote_draft: Agent 維護的報價草稿 dict
-
-    Returns:
-        {"total_cost": float, "total_price": float, "items": [...], ...}
-    """
-    validation = validate_quote_draft(quote_draft)
-    if not validation["valid"]:
-        raise ValueError("報價規格驗證失敗：" + "；".join(validation["errors"]))
-
-    prodkind = str(quote_draft.get("prodkind", "")).strip()
-    if prodkind and repo.expand_ordstr_tree(prodkind):
-        from engine.calculator import calculate_from_ordstr
-        calc = calculate_from_ordstr(
-            prodkind,
-            quote_draft.get("selections", {}),
-            qty=float(quote_draft.get("qty", 1)),
-            discount_rate=float(quote_draft.get("discount_rate", 0.0)),
-        )
-    else:
-        calc = calculate_from_draft(quote_draft)
-    return {
-        "total_cost": calc.total_cost,
-        "subtotal": calc.subtotal,
-        "discount_rate": calc.discount_rate,
-        "discount_amount": calc.discount_amount,
-        "after_discount": calc.after_discount,
-        "tax_rate": calc.tax_rate,
-        "tax_amount": calc.tax_amount,
-        "total_price": calc.total_price,
-        "markup_rate": calc.markup_rate,
-        "items": calc.items,
-    }
+    """純試算不建立可確認版本；所有模式共用完整配置計價。"""
+    from dataclasses import asdict
+    from engine.pricing import calculate_configuration
+    return asdict(calculate_configuration(quote_draft)[0])
 
 
 def preview_quote(quote_draft: dict) -> dict:
-    """
-    產生報價預覽（試算但不建立正式報價單）。
-    selections 以 optno 為 key，動態組合摘要文字。
-
-    Returns:
-        {"status": "preview", "calc": {...}, "summary": str}
-    """
-    calc_result = calculate_quote(quote_draft)
-    qty = quote_draft.get("qty", 0)
-    selections = quote_draft.get("selections", {})
-
-    # 動態組合已選規格說明（optdesc: codsc）
-    sel_lines = []
-    for optno, sel in selections.items():
-        optdesc = sel.get("optdesc", optno)
-        codsc = sel.get("codsc", "未指定")
-        sel_lines.append(f"  {optdesc}：{codsc}")
-
-    sel_text = "\n".join(sel_lines) if sel_lines else "  （尚未選擇規格）"
-
-    summary = (
-        f"📋 報價預覽\n"
-        f"  產品：{quote_draft.get('product_name', '辦公桌')}  數量：{qty} 張\n"
-        f"{sel_text}\n"
-        f"  ─────────────────────────\n"
-        f"  材料成本：${calc_result['total_cost']:,.0f}\n"
-        f"  小計（含加成）：${calc_result['subtotal']:,.0f}\n"
-        f"  折扣金額：-${calc_result['discount_amount']:,.0f}\n"
-        f"  稅額：${calc_result['tax_amount']:,.0f}\n"
-        f"  ─────────────────────────\n"
-        f"  ✅ 建議報價總金額：${calc_result['total_price']:,.0f}"
-    )
-
-    return {"status": "preview", "calc": calc_result, "summary": summary}
+    """只有本函式成功後才可進入 PREVIEW，預覽持有固定且完整的計算版本。"""
+    from engine.preview import freeze_preview
+    preview = freeze_preview(quote_draft)
+    calc = preview["calc"]
+    lines = ["📋 固定版本報價預覽", f"版本：{preview['revision']} / {preview['preview_id'][:8]}",
+             f"產品：{quote_draft.get('product_name', quote_draft.get('prodkind'))}，數量：{quote_draft['qty']}"]
+    for selection in preview["selections"].values():
+        if selection.get("code"):
+            lines.append(f"{selection['path']}：{selection['codsc']}（每件 {selection['line_qty']:g}）")
+    lines.extend([f"材料與工費成本：{calc['total_cost']:,.2f}",
+                  f"加成後小計：{calc['subtotal']:,.2f}",
+                  f"折扣：{calc['discount_amount']:,.2f}，稅額：{calc['tax_amount']:,.2f}",
+                  f"報價總額：{calc['total_price']:,.2f}",
+                  "確認將保存此版本，不重新套用主檔價格；修改需求需重新預覽。"])
+    return {"status": "preview", "preview_id": preview["preview_id"], "calc": calc,
+            "summary": "\n".join(lines)}
 
 
-def create_quote(quote_draft: dict, user: str = "SYS") -> dict:
-    """
-    使用者確認後建立正式報價（寫入 ordqdt_ai 快照）。
-    只有在使用者明確確認後才呼叫此函式。
-
-    Args:
-        quote_draft: 已完整填寫的報價草稿
-        user:        建立人員代號
-
-    Returns:
-        {"success": bool, "ref_no": str, "message": str}
-    """
-    from engine.calculator import calculate_from_draft
+def create_quote(quote_draft: dict, user: str = "SYS", *, preview_id: str) -> dict:
+    """UI 確認指定版本；不查規格主檔、不重新計價。相同預覽可安全重試。"""
+    from copy import deepcopy
+    from engine.preview import checked_preview
+    from engine.calculator import CalcResult
     from engine.snapshot import create_quote_snapshot
-
-    validation = validate_quote_draft(quote_draft)
-    if not validation["valid"]:
-        raise ValueError("報價規格驗證失敗：" + "；".join(validation["errors"]))
-
-    prodkind = str(quote_draft.get("prodkind", "")).strip()
-    from engine.calculator import calculate_from_ordstr
-    if prodkind and repo.expand_ordstr_tree(prodkind):
-        calc = calculate_from_ordstr(
-            prodkind,
-            quote_draft.get("selections", {}),
-            qty=float(quote_draft.get("qty", 1)),
-            discount_rate=float(quote_draft.get("discount_rate", 0.0)),
-        )
-    else:
-        calc = calculate_from_draft(quote_draft)
-    ref_no = create_quote_snapshot(calc_result=calc, quote_draft=quote_draft, user=user)
-
-    return {
-        "success": True,
-        "ref_no": ref_no,
-        "total_price": calc.total_price,
-        "message": f"已成功建立報價單 {ref_no}，報價金額 ${calc.total_price:,.0f} 元。",
-    }
+    preview = checked_preview(quote_draft, preview_id)
+    calc = CalcResult(**preview["calc"])
+    frozen_draft = {"selections": preview["selections"], "qty": preview["identity"]["qty"]}
+    ref_no = create_quote_snapshot(calc_result=calc, quote_draft=frozen_draft, user=user,
+                                  workgroup=preview["identity"]["workgroup"], preview=preview)
+    quote_draft.update(status="SNAPSHOT_CREATED", ref_no=ref_no, calc_result=deepcopy(preview["calc"]))
+    return {"success": True, "ref_no": ref_no, "preview_id": preview_id,
+            "total_price": calc.total_price, "calc": deepcopy(preview["calc"]),
+            "message": f"已建立報價單 {ref_no}，確認版本總額 {calc.total_price:,.2f}。"}
 
 
 def validate_quote_draft(quote_draft: dict) -> dict:
-    """驗證草稿中的每個規格是否仍存在於資料庫白名單。
-
-    必選項目檢查以 ordstr.must_chose 為權威來源（透過
-    engine.calculator.check_required_selections），
-    當 ordstr 查無資料時 fallback 回 config.REQUIRED_OPTNOS。
-    """
-    from config import REQUIRED_OPTNOS
-
-    errors: list[str] = []
-    selections = quote_draft.get("selections", {})
-
-    if not quote_draft.get("qty"):
-        errors.append("缺少數量")
-
-    # ── 必選項目檢查：優先採用 ordstr.must_chose（權威來源） ──
-    prodkind = str(quote_draft.get("prodkind", PRODUCT_PREFIX)).strip() or PRODUCT_PREFIX
-    required_nodes = repo.get_required_nodes(prodkind)
-
-    if required_nodes:
-        # ordstr 有必選節點定義：以結構樹為準
-        from engine.calculator import check_required_selections
-        missing_nodes = check_required_selections(prodkind, selections)
-        for node in missing_nodes:
-            desc = node.get("dmark") or node.get("optnoc") or node.get("pathc")
-            errors.append(f"缺少必選項目：{node.get('pathc')}（{desc}）")
-    else:
-        # fallback：ordstr 無資料時沿用 REQUIRED_OPTNOS
-        missing_optnos = [optno for optno in REQUIRED_OPTNOS if optno not in selections]
-        if missing_optnos:
-            errors.append("缺少必要規格：" + ", ".join(missing_optnos))
-
-    for key, selection in selections.items():
-        path = str(selection.get("path", "")).strip()
-        code = str(selection.get("code", "")).strip()
-        optno = str(selection.get("optno", "")).strip()
-        if not path or not code:
-            errors.append(f"{key} 缺少 path 或 code")
-            continue
-
-        prefix = prodkind or PRODUCT_PREFIX
-        if not path.startswith(f"{prefix}\\"):
-            errors.append(f"{path} 不屬於目前產品 {prefix}")
-            continue
-
-        # 子部件的 selection 會以自身 optno 為識別（例如
-        # CMT1\A001\S004 → S004），不能只取產品路徑下的第一段 A001。
-        path_parts = path.removeprefix(f"{prefix}\\").split("\\")
-        path_optno = path_parts[-1] if path_parts else ""
-        if optno and path_optno and optno != path_optno:
-            errors.append(f"{path} 與 optno {optno} 不一致")
-            continue
-
-        options = repo.get_options_by_path(path)
-        matched = next((item for item in options if item["code"] == code), None)
-        if matched is None:
-            errors.append(f"{path} 不存在規格代碼 {code}")
-            continue
-
-        # 以資料庫內容覆寫可能被 LLM 修改的描述與成本。
-        selection["codsc"] = matched["codsc"]
-        selection["compri"] = matched["compri"]
-
+    """配置驗證不覆寫來源資料；計價時另驗證用量及金額。"""
+    from engine.configuration import resolve_configuration, number
+    errors = []
+    try:
+        number(quote_draft.get("qty"), "產品數量", positive=True)
+        resolved = resolve_configuration(quote_draft)
+        errors.extend(resolved["errors"] + resolved["missing"])
+        if quote_draft.get("questions") or quote_draft.get("pending_options"):
+            errors.append("尚有未確認的需求或候選規格")
+    except ValueError as exc:
+        errors.append(str(exc))
     return {"valid": not errors, "errors": errors}
 
 
@@ -463,7 +339,6 @@ TOOL_REGISTRY: dict[str, Any] = {
     "get_part_quantity": get_part_quantity,
     "calculate_quote": calculate_quote,
     "preview_quote": preview_quote,
-    "create_quote": create_quote,
 }
 
 

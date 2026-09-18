@@ -116,8 +116,10 @@ def search_product(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
                 "path": (r.path or "").strip(),
                 "code": (r.code or "").strip(),
                 "codsc": (r.codsc or "").strip(),
-                "compri": r.compri or 0.0,
-                "optno": optno_from_path((r.path or "").strip()),
+                "compri": r.compri,
+                # nested path 的選項類別是最後一段（例如 S001），
+                # 不能回傳根節點 A001，否則 LLM 會用色紙覆寫尺寸。
+                "optno": (r.path or "").strip().rsplit("\\", 1)[-1],
             }
             for r in rows
         ]
@@ -197,7 +199,7 @@ def search_option(keyword: str, workgroup: str = WORKGROUP) -> list[dict]:
                 "code": (r.code or "").strip(),
                 "codsc": (r.codsc or "").strip(),
                 "compri": r.compri or 0.0,
-                "optno": optno_from_path((r.path or "").strip()),
+                "optno": (r.path or "").strip().rsplit("\\", 1)[-1],
             }
             for r in rows
         ]
@@ -244,7 +246,7 @@ def search_option_fuzzy(
                 "code": code,
                 "codsc": codsc,
                 "compri": row.compri or 0.0,
-                "optno": optno_from_path(path),
+                "optno": path.rsplit("\\", 1)[-1],
                 "match_score": round(score, 4),
                 "match_type": "fuzzy",
             })
@@ -283,7 +285,7 @@ def get_options_by_path(path: str, workgroup: str = WORKGROUP) -> list[dict]:
             {
                 "code": (r.code or "").strip(),
                 "codsc": (r.codsc or "").strip(),
-                "compri": r.compri or 0.0,
+                "compri": r.compri,
             }
             for r in rows
         ]
@@ -334,8 +336,8 @@ def get_part_quantity(
             "code": (row.code or "").strip(),
             "codsc": (row.codsc or "").strip() if row.codsc else None,
             "part_path": (row.part_path or "").strip() if row.part_path else None,
-            "stdqty": row.stdqty or 1.0,
-            "stdpar": row.stdpar or 1.0,
+            "stdqty": row.stdqty,
+            "stdpar": row.stdpar,
         }
     finally:
         db.close()
@@ -348,6 +350,18 @@ def get_part_quantity(
 #   同上，移除 codsc WHERE 條件。
 #   改為只用 (workgroup, path, code) 三欄比對。
 # ============================================================
+
+def get_quantity_rules(path: str, workgroup: str = WORKGROUP) -> list[dict]:
+    """先取得 part_path，再由該部位所選 code 決定用量；不以材料 code 猜測。"""
+    db = _session()
+    try:
+        rows = db.query(Ordqty).filter(Ordqty.workgroup == workgroup, Ordqty.path == path).all()
+        return [{"path": r.path.strip(), "code": r.code.strip(),
+                 "part_path": (r.part_path or "").strip(),
+                 "stdqty": r.stdqty, "stdpar": r.stdpar} for r in rows]
+    finally:
+        db.close()
+
 
 def get_option_price(
     path: str,
@@ -388,6 +402,7 @@ def get_option_price(
 def save_quote_snapshot(
     items: list[dict],
     workgroup: str = WORKGROUP,
+    preview: Optional[dict] = None,
 ) -> str:
     """
     將報價明細清單寫入 ordqdt_ai（報價快照）。
@@ -409,6 +424,16 @@ def save_quote_snapshot(
     ref_no = items[0]["ref_no"]
     db = _session()
     try:
+        if preview is not None:
+            import json
+            from database.models import QuoteSnapshotDocument
+            existing = db.get(QuoteSnapshotDocument, (workgroup, preview["preview_id"]))
+            if existing:
+                if json.loads(existing.payload).get("digest") != preview.get("digest"):
+                    raise ValueError("同一預覽版本的保存內容不一致")
+                return existing.ref_no
+            db.add(QuoteSnapshotDocument(workgroup=workgroup, preview_id=preview["preview_id"],
+                                        ref_no=ref_no, payload=json.dumps(preview, ensure_ascii=False, allow_nan=False)))
         for item in items:
             snapshot = ordqdt_ai(
                 workgroup=item.get("workgroup", workgroup),
@@ -734,3 +759,52 @@ def get_required_nodes(
     """
     nodes = expand_ordstr_tree(root_path, workgroup=workgroup)
     return [n for n in nodes if (n.get("must_chose") or "").upper() == "Y"]
+
+
+def get_actionable_required_nodes(
+    root_path: str,
+    workgroup: str = WORKGROUP,
+    selections: Optional[dict] = None,
+) -> list[dict]:
+    """取得需要使用者選擇的必選節點，排除結構／製程節點。
+
+    ordstr 的 must_chose 也可能標在沒有可選規格的父節點，或 W001
+    製程節點。這些節點應由結構樹與成本規則處理，不應直接顯示給客戶。
+    """
+    result: list[dict] = []
+    seen: set[str] = set()
+    tree = expand_ordstr_tree(root_path, workgroup=workgroup)
+    required_nodes = [n for n in tree if (n.get("must_chose") or "").upper() == "Y"]
+    chosen_paths = {
+        str(value.get("path", "")).strip()
+        for value in (selections or {}).values()
+        if isinstance(value, dict)
+    }
+    # 呼叫端會在草稿中提供選擇；此 helper 的保守版本只排除明確的
+    # 製程節點與沒有選項的結構節點，分支啟用狀態由 calculator 再判斷。
+    for node in required_nodes:
+        path = str(node.get("pathc", "")).strip()
+        parts = path.split("\\")
+        if not path or path in seen or "W001" in parts or parts[-1] == "S000":
+            continue
+        # 必選節點位於非必選分支時，只有該分支有實際選擇才需要詢問。
+        ancestor_parts = parts[1:-1]
+        active = True
+        for index, part in enumerate(ancestor_parts, start=1):
+            ancestor = "\\".join(parts[: index + 1])
+            ancestor_node = next((n for n in tree if n.get("pathc") == ancestor), None)
+            if ancestor_node and (ancestor_node.get("must_chose") or "").upper() != "Y":
+                active = any(
+                    selected == ancestor or selected.startswith(ancestor + "\\")
+                    for selected in chosen_paths
+                )
+                if not active:
+                    break
+        if not active:
+            continue
+        options = get_options_by_path(path, workgroup=workgroup)
+        if not options:
+            continue
+        seen.add(path)
+        result.append(node)
+    return result

@@ -281,6 +281,16 @@ class ordqdt_ai(Base):
         )
 
 
+class QuoteSnapshotDocument(Base):
+    """已確認預覽的完整文件；與明細同交易保存，預覽 ID 防止重複建立。"""
+    __tablename__ = "quote_snapshot_document"
+    workgroup: Mapped[str] = mapped_column(String(3), primary_key=True)
+    preview_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    ref_no: Mapped[str] = mapped_column(String(21), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    __table_args__ = (UniqueConstraint("workgroup", "ref_no", name="uq_snapshot_document_ref"),)
+
+
 # ============================================================
 # 建立所有資料表（若不存在）
 # ============================================================

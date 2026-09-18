@@ -110,8 +110,8 @@ def build_snapshot_items(
             "part_code": item.get("part_code", ""),
             "part_desc": item.get("part_desc", ""),
             "path": item.get("path", ""),
-            "opt_code": sel_info.get("opt_code") or sel_info.get("code", ""),
-            "opt_desc": sel_info.get("optdesc", ""),
+            "opt_code": item.get("optno") or sel_info.get("optno", ""),
+            "opt_desc": item.get("optdesc") or sel_info.get("optdesc", ""),
             "spc_code": spc_code,
             "spdsc": item.get("spdsc", ""),
             "qty": item.get("qty", 0),
@@ -122,6 +122,38 @@ def build_snapshot_items(
             "amount": item.get("amount", 0.0),
             "unit": item.get("unit", "PCS"),
             "status": "C",  # C = 已確認
+            "adddate": today,
+            "addusrno": user,
+        })
+
+    # 報價計算只保留有成本的葉節點，但正式快照仍需保留使用者已確認的
+    # 零成本／結構節點（例如 A001 尺寸、S010 桌面外型），否則訂單規格
+    # 會看起來不完整。這些節點不增加 total_price。
+    represented = {item.get("path") for item in calc_result.items}
+    for sel in selections.values():
+        path = sel.get("path", "")
+        if not path or path in represented:
+            continue
+        seq_no = f"{len(snapshot_items) + 1:05d}"
+        snapshot_items.append({
+            "workgroup": workgroup,
+            "ref_no": ref_no,
+            "seq_no": seq_no,
+            "part_code": sel.get("code", ""),
+            "part_desc": sel.get("codsc", ""),
+            "path": path,
+            "opt_code": sel.get("optno", ""),
+            "opt_desc": sel.get("optdesc", ""),
+            "spc_code": sel.get("code", ""),
+            "spdsc": sel.get("codsc", ""),
+            "qty": quote_draft.get("qty", 1),
+            "stdqty": 1.0,
+            "stdpar": 1.0,
+            "compri": 0.0,
+            "unit_price": 0.0,
+            "amount": 0.0,
+            "unit": "PCS",
+            "status": "C",
             "adddate": today,
             "addusrno": user,
         })
@@ -138,6 +170,7 @@ def create_quote_snapshot(
     quote_draft: dict,
     user: str = "SYS",
     workgroup: str = WORKGROUP,
+    preview: dict | None = None,
 ) -> str:
     """
     產生報價單號、組裝快照資料、寫入 ordqdt_ai。
@@ -151,7 +184,9 @@ def create_quote_snapshot(
     Returns:
         str ref_no 報價單號
     """
-    ref_no = generate_ref_no(workgroup)
+    if preview is None:
+        raise ValueError("建立報價必須提供已確認的固定版本預覽")
+    ref_no = preview["ref_no"]
     items = build_snapshot_items(
         calc_result=calc_result,
         quote_draft=quote_draft,
@@ -159,5 +194,5 @@ def create_quote_snapshot(
         user=user,
         workgroup=workgroup,
     )
-    saved_ref_no = repo.save_quote_snapshot(items=items, workgroup=workgroup)
+    saved_ref_no = repo.save_quote_snapshot(items=items, workgroup=workgroup, preview=preview)
     return saved_ref_no

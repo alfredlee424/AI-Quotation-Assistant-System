@@ -11,6 +11,8 @@ Streamlit 雙區介面：
 
 from __future__ import annotations
 
+import time
+
 import streamlit as st
 
 from agent.core import run_quote_agent
@@ -25,7 +27,7 @@ from utils.helpers import (
     get_status_badge,
     fmt_money,
 )
-from utils.logger import log_user_input, log_quote_created
+from utils.logger import log_action, log_error, log_quote_created, log_user_input
 from config import USE_LLM, OPENAI_MODEL, IS_SQLITE, print_config
 
 
@@ -69,6 +71,70 @@ if "quote_confirmed" not in st.session_state:
     st.session_state.quote_confirmed: bool = False
 
 
+def _process_chat_prompt(prompt: str, source: str, chat_container) -> None:
+    """立即渲染使用者訊息，再於同一個聊天區顯示 Agent 等待狀態。"""
+    started_at = time.perf_counter()
+    log_user_input(prompt)
+    log_action(
+        "agent_request_started",
+        params={"source": source, "text_length": len(prompt)},
+    )
+
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # 這裡不能等到 run_quote_agent() 完成後才渲染；否則同步 LLM 呼叫期間畫面會停在舊狀態。
+    with chat_container:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("🔍 AI 分析需求與查詢規格中…"):
+                try:
+                    response, updated_quote = run_quote_agent(
+                        user_input=prompt,
+                        quote_draft=st.session_state.current_quote,
+                        messages=st.session_state.messages,
+                    )
+                except Exception as exc:
+                    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                    log_error(
+                        "Agent 執行失敗",
+                        context={
+                            "source": source,
+                            "elapsed_ms": elapsed_ms,
+                            "text_length": len(prompt),
+                        },
+                    )
+                    log_action(
+                        "agent_request_finished",
+                        params={"source": source},
+                        result={"success": False, "elapsed_ms": elapsed_ms},
+                    )
+                    response = f"❌ AI 處理時發生錯誤：{exc}"
+                    updated_quote = st.session_state.current_quote
+                else:
+                    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                    log_action(
+                        "agent_request_finished",
+                        params={"source": source},
+                        result={
+                            "success": True,
+                            "elapsed_ms": elapsed_ms,
+                            "response_length": len(response),
+                            "status": str(updated_quote.get("status", "")),
+                        },
+                    )
+                st.markdown(response)
+
+    st.session_state.current_quote = updated_quote
+    st.session_state.messages.append({"role": "assistant", "content": response})
+
+    if updated_quote.get("status") != QuoteStatus.SNAPSHOT_CREATED:
+        st.session_state.quote_confirmed = False
+
+    # 下一次 rerun 會依 messages 正常渲染完整對話，避免暫時畫面與歷史訊息重複。
+    st.rerun()
+
+
 # ============================================================
 # 全域標題
 # ============================================================
@@ -109,10 +175,11 @@ with left_col:
     # ── 完整報價單貼上匯入 ─────────────────────────────────
     with st.expander("📥 貼上完整報價單（13 欄 TSV）", expanded=False):
         st.caption(
-            "欄位順序：事業別、報價單號、path、狀態、代碼、規格、"
-            "數量、標準用量、來源成本、日期、時間、使用者、來源。"
-            "匯入成本僅作參考，正式試算會重新查詢資料庫。"
+            "欄位順序：事業別、報價單號、path、明細數量、代碼、規格、"
+            "用料量、裁切量、來源單價、日期、時間、使用者、來源。"
+            "此功能為依現行主檔重報，非還原歷史金額。"
         )
+        imported_product_qty = st.number_input("重報的產品數量（不可由材料用量推定）", min_value=1, value=1)
         pasted_quote = st.text_area(
             "貼上報價明細",
             height=220,
@@ -121,13 +188,13 @@ with left_col:
         )
         if st.button("匯入並重新試算", use_container_width=True):
             try:
-                imported = import_pasted_quote(pasted_quote)
+                imported = import_pasted_quote(pasted_quote, product_qty=imported_product_qty)
                 draft = imported.draft
-                preview = preview_quote(draft)
-                draft["calc_result"] = preview["calc"]
                 draft["imported_quote"]["source_total_rows"] = len(imported.rows)
                 st.session_state.current_quote = draft
                 st.session_state.quote_confirmed = False
+                preview = preview_quote(draft)
+                draft["calc_result"] = preview["calc"]
                 natural_request = quotation_to_natural_language(imported.rows)
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -148,7 +215,7 @@ with left_col:
             st.markdown(
                 "👋 **歡迎使用 AI 報價助理！**\n\n"
                 "請直接描述您的需求，例如：\n\n"
-                "> 我要 20 張 60*120 的桌子，美耐板白色，木腳。\n\n"
+                "> 我要 1 張 60*180 的環式會議桌，MDF，胡桃，銀鋁單掀，45寬環式腳。\n\n"
                 "系統將自動解析並為您試算報價。"
             )
 
@@ -157,34 +224,12 @@ with left_col:
                 st.markdown(msg["content"])
 
     # 使用者輸入
-    if prompt := st.chat_input("請輸入需求，例如：20張 60*120 美耐板白色木腳桌子…"):
-        # 記錄輸入
-        log_user_input(prompt)
-
-        # 新增到歷史
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
-        # 呼叫 Agent
-        with st.spinner("🔍 AI 分析需求與查詢規格中…"):
-            response, updated_quote = run_quote_agent(
-                user_input=prompt,
-                quote_draft=st.session_state.current_quote,
-                messages=st.session_state.messages,
-            )
-
-        # 更新狀態
-        st.session_state.current_quote = updated_quote
-        st.session_state.messages.append({"role": "assistant", "content": response})
-
-        # 重置確認狀態（若 draft 已更新）
-        if updated_quote.get("status") != QuoteStatus.SNAPSHOT_CREATED:
-            st.session_state.quote_confirmed = False
-
-        st.rerun()
+    if prompt := st.chat_input("請輸入需求，例如：1張 60*180 的環式會議桌，MDF，胡桃，銀鋁單掀，45寬環式腳…"):
+        _process_chat_prompt(prompt, "chat_input", chat_container)
 
     # 快捷按鈕
     st.markdown("**快捷輸入：**")
-    btn_cols = st.columns(3)
+    btn_cols = st.columns(2)
     with btn_cols[0]:
         if st.button("🔄 重新開始", use_container_width=True):
             st.session_state.current_quote = new_quote_draft()
@@ -192,29 +237,12 @@ with left_col:
             st.session_state.quote_confirmed = False
             st.rerun()
     with btn_cols[1]:
-        if st.button("📐 標準規格", use_container_width=True):
-            prompt = "使用標準規格"
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            response, updated_quote = run_quote_agent(
-                user_input=prompt,
-                quote_draft=st.session_state.current_quote,
-                messages=st.session_state.messages,
-            )
-            st.session_state.current_quote = updated_quote
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            st.rerun()
-    with btn_cols[2]:
         if st.button("📋 範例需求", use_container_width=True):
-            prompt = "我要 20 張 60*120 的桌子，MDF，胡桃，木腳"
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            response, updated_quote = run_quote_agent(
-                user_input=prompt,
-                quote_draft=st.session_state.current_quote,
-                messages=st.session_state.messages,
+            _process_chat_prompt(
+                "我要 1 張 60*180 的環式會議桌，MDF，胡桃，銀鋁單掀，45寬環式腳",
+                "example_button",
+                chat_container,
             )
-            st.session_state.current_quote = updated_quote
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            st.rerun()
 
 
 # ============================================================
@@ -336,17 +364,26 @@ with right_col:
             )
 
     # ── 確認建立報價按鈕（只在 PREVIEW 狀態顯示）────────
-    if status == QuoteStatus.PREVIEW:
+    if status == QuoteStatus.PREVIEW and quote_data.get("preview"):
         st.divider()
+        from engine.preview import checked_preview
+        current_preview_id = quote_data["preview"]["preview_id"]
+        try:
+            checked_preview(quote_data, current_preview_id)
+        except ValueError as exc:
+            st.session_state.quote_confirmed = False
+            st.warning(str(exc))
+            st.stop()
+        st.caption(f"固定預覽版本：{current_preview_id[:8]}｜確認後保存此版金額，不重新計價")
 
-        if not st.session_state.quote_confirmed:
+        if st.session_state.quote_confirmed != current_preview_id:
             confirm = st.button(
                 "✅ 確認建立正式報價單（寫入 ordqdt_ai）",
                 type="primary",
                 use_container_width=True,
             )
             if confirm:
-                st.session_state.quote_confirmed = True
+                st.session_state.quote_confirmed = current_preview_id
                 st.rerun()
         else:
             st.warning("⚠️ **確認後將寫入正式報價快照，此操作無法撤銷。**")
@@ -355,9 +392,10 @@ with right_col:
                 if st.button("✅ 確定建立", type="primary", use_container_width=True):
                     with st.spinner("⚙️ 建立報價快照中…"):
                         try:
-                            result = create_quote(quote_data, user="SYS")
+                            result = create_quote(quote_data, user="SYS", preview_id=current_preview_id)
                             st.session_state.current_quote["status"] = QuoteStatus.SNAPSHOT_CREATED
                             st.session_state.current_quote["ref_no"] = result["ref_no"]
+                            st.session_state.current_quote["calc_result"] = result["calc"]
                             # 記錄到稽核日誌
                             log_quote_created(result["ref_no"], result.get("total_price", 0))
                             # 加入對話歷史

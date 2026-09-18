@@ -4,7 +4,7 @@ engine/calculator.py - 報價計算引擎
 所有金額計算集中於此模組，AI Agent 不得介入任何計算。
 
 計算流程：
-    部件成本 = 數量 × stdqty × compri
+    部件成本 = 數量 × stdqty ÷ stdpar × compri
     材料總成本 = Σ 部件成本
     加成後售價 = 材料總成本 × (1 + MARKUP_RATE)
     折扣後售價 = 加成後售價 × (1 - discount_rate)
@@ -53,10 +53,12 @@ ordqty 查詢規則（已驗證）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from config import MARKUP_RATE, TAX_RATE, MAX_DISCOUNT_RATE, PRODUCT_PREFIX
 from database import repository as repo
+from utils.logger import log_action
 
 
 def _quo_rate_to_markup(quo_rate: Optional[float]) -> float:
@@ -102,8 +104,13 @@ class QuoteItem:
 
     @property
     def part_cost(self) -> float:
-        """單項部件成本 = 數量 × 標準用量 × 採購成本"""
-        return self.qty * self.stdqty * self.compri
+        """數量 × 用料量 ÷ 裁切量 × 採購單價；零用量合法，零分母不合法。"""
+        from engine.configuration import number
+        quantity = number(self.qty, "明細數量", positive=True)
+        usage = number(self.stdqty, "用料量")
+        divisor = number(self.stdpar, "裁切量", positive=True)
+        price = number(self.compri, "採購單價")
+        return float(Decimal(str(quantity)) * Decimal(str(usage)) / Decimal(str(divisor)) * Decimal(str(price)))
 
 
 @dataclass
@@ -143,11 +150,14 @@ def calculate_quote(
     Returns:
         CalcResult 完整計算結果
     """
-    _markup = markup_rate if markup_rate is not None else MARKUP_RATE
-    _tax = tax_rate if tax_rate is not None else TAX_RATE
-
-    # 折扣率上限保護
-    _discount = min(discount_rate, MAX_DISCOUNT_RATE)
+    from engine.configuration import number
+    _markup = float(markup_rate if markup_rate is not None else MARKUP_RATE)
+    number(1 + _markup, "報價係數", positive=True)
+    _tax = number(tax_rate if tax_rate is not None else TAX_RATE, "稅率")
+    _discount = number(discount_rate, "折扣率")
+    if _discount > min(MAX_DISCOUNT_RATE, 1):
+        raise ValueError("折扣超過允許範圍")
+    money = lambda value: float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     # ── 計算各明細成本與單價 ──────────────────────────────
     result_items: list[dict] = []
@@ -171,10 +181,10 @@ def calculate_quote(
             "stdqty": item.stdqty,
             "stdpar": item.stdpar,
             "compri": item.compri,
-            "part_cost": round(part_cost, 2),
-            "unit_cost": round(unit_cost, 2),
-            "unit_price": round(unit_price, 2),
-            "amount": round(amount, 2),
+            "part_cost": money(part_cost),
+            "unit_cost": money(unit_cost),
+            "unit_price": money(unit_price),
+            "amount": money(amount),
             "unit": "PCS",
         })
         total_cost += part_cost
@@ -188,14 +198,14 @@ def calculate_quote(
 
     return CalcResult(
         items=result_items,
-        total_cost=round(total_cost, 2),
-        subtotal=round(subtotal, 2),
+        total_cost=money(total_cost),
+        subtotal=money(subtotal),
         discount_rate=_discount,
-        discount_amount=round(discount_amount, 2),
-        after_discount=round(after_discount, 2),
+        discount_amount=money(discount_amount),
+        after_discount=money(after_discount),
         tax_rate=_tax,
-        tax_amount=round(tax_amount, 2),
-        total_price=round(total_price, 2),
+        tax_amount=money(tax_amount),
+        total_price=money(total_price),
         markup_rate=_markup,
     )
 
@@ -254,7 +264,7 @@ def _get_driver_code(path: str, selections: dict, prefix: str = PRODUCT_PREFIX) 
         驅動根節點的選擇代碼字串；若根節點不在 selections 中，回傳空字串
     """
     root_optno = _get_root_optno(path, prefix)
-    root_sel = selections.get(root_optno, {})
+    root_sel = next((item for item in selections.values() if item.get("path") == prefix + "\\" + root_optno), {})
     return root_sel.get("code", "")
 
 
@@ -263,142 +273,22 @@ def _get_driver_code(path: str, selections: dict, prefix: str = PRODUCT_PREFIX) 
 # ============================================================
 
 def calculate_from_draft(quote_draft: dict) -> CalcResult:
-    """
-    從報價草稿（agent 維護的 current_quote dict）計算報價。
-
-    quote_draft 格式（optno 驅動）：
-    {
-        "product_name": "辦公桌",
-        "qty": 20,
-        "selections": {
-            "A001": {
-                "optno": "A001",
-                "optdesc": "桌面尺寸",
-                "path": "CMT1\\A001",
-                "code": "C005",         # 使用者選的尺寸代碼（驅動 A001 樹所有子部件）
-                "codsc": "60*180",
-                "compri": 0.0,
-            },
-            "S004": {
-                "optno": "S004",
-                "optdesc": "板材",
-                "path": "CMT1\\A001\\S004",   # A001 樹的子部件
-                "code": "C001",               # S004 自身選擇（材質）
-                "codsc": "25mm MDF",
-                "compri": 700.0,
-            },
-            "B001": {
-                "optno": "B001",
-                "optdesc": "木腳尺寸",
-                "path": "CMT1\\B001",
-                "code": "C001",         # 使用者選的木腳代碼（驅動 B001 樹所有子部件）
-                "codsc": "45寬環式腳",
-                "compri": 0.0,
-            },
-        },
-        "discount_rate": 0.0,
-    }
-
-    ordqty 查詢修正說明：
-        - 修正前（錯誤）：用每個選項自身的 code 查 ordqty
-          → CMT1\\A001\\S004 用 code=C001（材質代碼），查不到正確 stdqty，fallback 為 1.0
-        - 修正後（正確）：用子部件所屬產品樹根節點所選的 code 查 ordqty
-          → CMT1\\A001\\S004 用 A001 的 code=C005（尺寸代碼），正確取得 stdqty=4.5
-    """
-    qty: float = float(quote_draft.get("qty", 1))
-    selections: dict = quote_draft.get("selections", {})
-    discount_rate: float = float(quote_draft.get("discount_rate", 0.0))
-
-    items: list[QuoteItem] = []
-
-    for optno, sel in selections.items():
-        path = sel.get("path", "")
-        code = sel.get("code", "")
-        codsc = sel.get("codsc", "")
-        optdesc = sel.get("optdesc", "")
-
-        # ── 修正核心：取驅動根節點所選代碼查 ordqty ─────────────
-        # 真實 ordqty 結構：ordqty.code = 驅動根節點（part_path）所選代碼
-        # 例：CMT1\A001\S004 的 stdqty 必須用 A001 的 code（如 C005=60*180）查詢
-        driver_code = _get_driver_code(path, selections)
-        # 若找不到驅動代碼（根節點不在 selections），fallback 用自身 code
-        lookup_code = driver_code if driver_code else code
-
-        # 取得用量規則（不傳 codsc，因真實 ordqty.codsc 全為 NULL）
-        qty_rule = repo.get_part_quantity(path=path, code=lookup_code)
-        stdqty = qty_rule["stdqty"] if qty_rule else 1.0
-        stdpar = qty_rule["stdpar"] if qty_rule else 1.0
-
-        # 取得最新採購成本（快照前的主檔值），仍用部件自身 code 查 ordspe
-        compri = repo.get_option_price(path=path, code=code)
-
-        # compri = 0 時略過此項（無成本的結構節點，如桌面尺寸根節點、標準顏色）
-        if compri == 0.0:
-            continue
-
-        items.append(QuoteItem(
-            part_code=code,
-            part_desc=codsc,
-            path=path,
-            spc_code=code,
-            spdsc=codsc,
-            qty=qty,
-            stdqty=stdqty,
-            stdpar=stdpar,
-            compri=compri,
-            optno=optno,
-            optdesc=optdesc,
-        ))
-
-    return calculate_quote(items, discount_rate=discount_rate)
+    """相容入口：所有新報價均須通過完整結構驗證。"""
+    from engine.pricing import calculate_configuration
+    return calculate_configuration(quote_draft)[0]
 
 
 # ============================================================
 # 必選項目完整性檢查（以 ordstr.must_chose 為權威來源）
 # ============================================================
 
-def check_required_selections(
-    prodkind: str,
-    selections: dict,
-) -> list[dict]:
-    """
-    以 ordstr 結構樹的必選節點（must_chose='Y'）比對 selections，
-    回傳「缺少的必選節點」清單。
-
-    比對方式：
-        必選節點以 pathc（完整路徑）為主鍵。
-        selections 為 optno 驅動的 dict，其 value 內含 path 欄位。
-        將 selections 已涵蓋的 path 集合取出，
-        任何 must_chose='Y' 但 pathc 不在該集合中的節點即為缺項。
-
-    Args:
-        prodkind   : 產品類別代碼（作為 ordstr 展開根，如 "CMT1"）
-        selections : 報價草稿的 selections dict（以 optno 為 key）
-
-    Returns:
-        list[dict] 缺少的必選節點清單，每筆含 pathc, optnoc, dmark, seq；
-                   若無缺項回傳空清單
-    """
-    required = repo.get_required_nodes(prodkind)
-    if not required:
-        return []
-
-    chosen_paths = {
-        str(sel.get("path", "")).strip()
-        for sel in selections.values()
-    }
-
-    missing: list[dict] = []
-    for node in required:
-        pathc = str(node.get("pathc", "")).strip()
-        if pathc and pathc not in chosen_paths:
-            missing.append({
-                "pathc": pathc,
-                "optnoc": node.get("optnoc", ""),
-                "dmark": node.get("dmark"),
-                "seq": node.get("seq"),
-            })
-    return missing
+def check_required_selections(prodkind: str, selections: dict) -> list[dict]:
+    from engine.configuration import resolve_configuration
+    resolved = resolve_configuration({"prodkind": prodkind, "selections": selections})
+    if resolved["errors"]:
+        raise ValueError("；".join(resolved["errors"]))
+    return [{"pathc": path, "optnoc": path.rsplit("\\", 1)[-1], "dmark": path}
+            for path in resolved["allowed_options"]]
 
 
 # ============================================================
@@ -406,94 +296,8 @@ def check_required_selections(
 # ============================================================
 
 def calculate_from_ordstr(
-    prodkind: str,
-    selections: dict,
-    qty: float = 1.0,
-    discount_rate: float = 0.0,
+    prodkind: str, selections: dict, qty: float = 1.0, discount_rate: float = 0.0,
 ) -> CalcResult:
-    """
-    以 ordstr 結構樹為權威來源計算報價（改善後流程）。
-
-    流程：
-        1. 以 repo.expand_ordstr_tree(prodkind) 展開整棵結構樹。
-        2. 對每個葉節點（is_leaf=True，計價候選）：
-             - 成本 compri 回 ordspe 查（get_option_price）。
-             - 用量 stdqty 回 ordqty 查（get_part_quantity，
-               沿用 _get_driver_code 的驅動根節點代碼規則）。
-        3. 加成率改用 invdoc.quo_rate（報價係數，直接相乘）；
-           若 invdoc 查無資料或 quo_rate 為 NULL，fallback config.MARKUP_RATE。
-
-    葉節點所選代碼取得規則：
-        selections 以 optno 為 key，其 value 內含 code。
-        以葉節點 optnoc 對應 selections[optnoc]["code"] 取得使用者選擇；
-        若無對應，退回葉節點自身 optnoc 作為 ordspe 查詢代碼。
-
-    Args:
-        prodkind      : 產品類別代碼（ordstr 展開根，如 "CMT1"）
-        selections    : 報價草稿 selections dict（以 optno 為 key）
-        qty           : 訂購數量
-        discount_rate : 折扣率
-
-    Returns:
-        CalcResult 完整計算結果
-    """
-    prefix = prodkind
-
-    # ── 取得加成率（invdoc.quo_rate 報價係數，fallback MARKUP_RATE） ──
-    category = repo.get_product_category(prodkind)
-    quo_rate = category.get("quo_rate") if category else None
-    markup = _quo_rate_to_markup(quo_rate)
-
-    # ── 展開結構樹，取葉節點作為計價候選 ─────────────────────────
-    tree = repo.expand_ordstr_tree(prodkind)
-    leaf_nodes = [n for n in tree if n.get("is_leaf")]
-
-    items: list[QuoteItem] = []
-
-    for node in leaf_nodes:
-        path = str(node.get("pathc", "")).strip()
-        optnoc = str(node.get("optnoc", "")).strip()
-
-        # 葉節點對應的使用者選擇（以 optnoc 對 selections key）
-        # 新流程可用 optno、相對 path 或完整 path 作為 selection key；
-        # 優先取最精確的路徑，兼容既有 optno key 草稿。
-        relative_path = path.removeprefix(f"{prefix}\\")
-        sel = (
-            selections.get(path)
-            or selections.get(relative_path)
-            or selections.get(optnoc, {})
-        )
-        code = str(sel.get("code", "")).strip()
-        codsc = str(sel.get("codsc", "")).strip()
-        optdesc = str(sel.get("optdesc", "")).strip()
-
-        # ordspe 查成本：優先用使用者選的 code，否則退回葉節點自身 optnoc
-        lookup_ordspe_code = code if code else optnoc
-        compri = repo.get_option_price(path=path, code=lookup_ordspe_code)
-
-        # 無成本的結構節點略過
-        if compri == 0.0:
-            continue
-
-        # ordqty 查用量：沿用驅動根節點代碼規則
-        driver_code = _get_driver_code(path, selections, prefix=prefix)
-        lookup_qty_code = driver_code if driver_code else lookup_ordspe_code
-        qty_rule = repo.get_part_quantity(path=path, code=lookup_qty_code)
-        stdqty = qty_rule["stdqty"] if qty_rule else 1.0
-        stdpar = qty_rule["stdpar"] if qty_rule else 1.0
-
-        items.append(QuoteItem(
-            part_code=lookup_ordspe_code,
-            part_desc=codsc,
-            path=path,
-            spc_code=lookup_ordspe_code,
-            spdsc=codsc,
-            qty=qty,
-            stdqty=stdqty,
-            stdpar=stdpar,
-            compri=compri,
-            optno=optnoc,
-            optdesc=optdesc,
-        ))
-
-    return calculate_quote(items, discount_rate=discount_rate, markup_rate=markup)
+    """相容入口：完整路徑配置、條件分支、驅動尺寸與工費共用同一解析器。"""
+    return calculate_from_draft({"prodkind": prodkind, "selections": selections,
+                                 "qty": qty, "discount_rate": discount_rate})

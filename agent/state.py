@@ -23,9 +23,9 @@ agent/state.py - Agent 狀態機定義
 
 錯誤時可進入 ERROR 狀態。
 
-selections 格式（optno 驅動，對齊真實資料庫結構）：
+    selections 格式（完整路徑作為鍵，對齊真實資料庫結構）：
     {
-        "A001": {
+        "CMT1\\A001": {
             "optno": "A001",
             "optdesc": "桌面尺寸",
             "path": "CMT1\\A001",
@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from config import REQUIRED_OPTNOS
+from config import WORKGROUP
 
 
 class QuoteStatus(str, Enum):
@@ -72,8 +72,8 @@ VALID_TRANSITIONS: dict[QuoteStatus, list[QuoteStatus]] = {
         QuoteStatus.PREVIEW,
         QuoteStatus.ERROR,
     ],
-    QuoteStatus.WAITING_FOR_INPUT: [QuoteStatus.CHECKING, QuoteStatus.ERROR],
-    QuoteStatus.PREVIEW: [QuoteStatus.CONFIRMED, QuoteStatus.CHECKING, QuoteStatus.ERROR],
+    QuoteStatus.WAITING_FOR_INPUT: [QuoteStatus.ANALYZING, QuoteStatus.CHECKING, QuoteStatus.ERROR],
+    QuoteStatus.PREVIEW: [QuoteStatus.CONFIRMED, QuoteStatus.ANALYZING, QuoteStatus.CHECKING, QuoteStatus.ERROR],
     QuoteStatus.CONFIRMED: [QuoteStatus.CREATING, QuoteStatus.ERROR],
     QuoteStatus.CREATING: [QuoteStatus.SNAPSHOT_CREATED, QuoteStatus.ERROR],
     QuoteStatus.SNAPSHOT_CREATED: [QuoteStatus.COMPLETED],
@@ -127,12 +127,12 @@ def new_quote_draft() -> dict:
     建立空白報價草稿。
     Agent 在整個對話過程中維護並更新此 dict。
 
-    selections 以 optno 為 key（對齊真實資料庫結構）：
+    selections 以完整 path 為 key（對齊真實資料庫結構）：
     {
         "product_name": str,
         "qty": int | None,
         "selections": {
-            "A001": {
+            "CMT1\\A001": {
                 "optno": "A001",
                 "optdesc": "桌面尺寸",
                 "path": "CMT1\\A001",
@@ -150,53 +150,54 @@ def new_quote_draft() -> dict:
     }
     """
     return {
-        "product_name": "辦公桌",
+        "product_name": "",
+        "prodkind": None,
+        "workgroup": WORKGROUP,
+        "revision": 0,
+        "preview": None,
         "qty": None,
         "selections": {},
         "discount_rate": 0.0,
         "status": QuoteStatus.NEW,
         "ref_no": None,
         "missing_fields": [],
+        "allowed_options": {},
+        "questions": [],
         "calc_result": None,
     }
 
 
 def check_missing_fields(quote_draft: dict) -> list[str]:
-    """
-    檢查報價草稿中缺少哪些必要欄位。
+    """以共用配置解析器檢查完整路徑；不吞掉資料庫錯誤或偽造預覽。
 
-    必填項目優先由 ordstr.must_chose 決定；沒有結構資料時，
-    才回退至 config.REQUIRED_OPTNOS。
-    數量（qty）永遠必填。
-
-    Returns:
-        list[str] 缺少的欄位中文名稱清單，空清單表示資料完整
+    未選產品時不可讓 resolver 使用相容性產品前綴。規格錯誤與缺項皆
+    阻止預覽；本函式只更新診斷資訊，不套用選擇或自行進入 PREVIEW。
     """
+    from engine.configuration import invalidate_preview, number, resolve_configuration
+
     missing: list[str] = []
-
-    # 數量必填
-    if not quote_draft.get("qty"):
+    if quote_draft.get("qty") is None:
         missing.append("數量")
-
-    selections = quote_draft.get("selections", {})
-    prodkind = str(quote_draft.get("prodkind", "")).strip()
-    required_nodes = []
-    if prodkind:
-        try:
-            from database import repository as repo
-            required_nodes = repo.get_required_nodes(prodkind)
-        except Exception:
-            required_nodes = []
-
-    if required_nodes:
-        chosen_paths = {str(v.get("path", "")).strip() for v in selections.values()}
-        for node in required_nodes:
-            path = str(node.get("pathc", "")).strip()
-            if path and path not in chosen_paths:
-                missing.append(node.get("dmark") or node.get("optnoc") or path)
     else:
-        for optno in REQUIRED_OPTNOS:
-            if optno not in selections:
-                missing.append(optno)
-
+        try:
+            number(quote_draft["qty"], "產品數量", positive=True)
+        except ValueError as exc:
+            missing.append(str(exc))
+    if not quote_draft.get("prodkind"):
+        missing.insert(0, "產品類別")
+        quote_draft["allowed_options"] = {}
+    else:
+        # 主檔缺失或連線失敗必須傳遞，不可回退到固定 REQUIRED_OPTNOS。
+        try:
+            resolved = resolve_configuration(quote_draft)
+        except Exception:
+            invalidate_preview(quote_draft)
+            raise
+        missing.extend(resolved["errors"])
+        missing.extend(resolved["missing"])
+        quote_draft["allowed_options"] = resolved["allowed_options"]
+    quote_draft["missing_fields"] = missing
+    if missing or quote_draft.get("questions") or quote_draft.get("pending_options"):
+        invalidate_preview(quote_draft)
+        quote_draft["status"] = QuoteStatus.WAITING_FOR_INPUT
     return missing
