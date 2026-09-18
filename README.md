@@ -53,16 +53,18 @@
 
 系統會自動完成以下步驟：
 
-1. 理解客戶需求（數量、尺寸、材質、腳架等）
-2. 找到對應產品（依 `PRODUCT_PREFIX` 設定定位，例如 `CMT1`）
-3. 以 `optno` 為驅動，找出各選項類別（A001 尺寸、S002 桌面材質、B001 腳架…）
-4. 將自然語言轉成正式代碼（例如「美耐板」→ `CLMT`）
-5. 找出缺少的必要條件並主動詢問（依 `REQUIRED_OPTNOS` 設定）
-6. 依 `ordqty` 資料查詢部件標準用量（`stdqty`）
-7. 呼叫報價引擎計算成本與售價：`compri × stdqty × qty`
-8. 顯示報價預覽
-9. 使用者確認後產生正式報價（寫入 `ordqdt_ai` 快照）
-10. 未來可由報價單轉成正式訂單
+1. 理解客戶需求（數量、尺寸、材質、腳架等）。
+2. 查詢 `invdoc`（`ordkind=1`）取得可報價產品類別，讓使用者選定 `prodkind`。
+3. 讀取該產品的 `quo_rate`，並以 `ordstr` 從根節點遞迴展開完整結構樹。
+4. 將自然語言轉成資料庫正式代碼，填入結構樹對應節點。
+5. 依 `ordstr.must_chose` 與 `seq` 檢查、排序缺少的必選項目並主動詢問。
+6. 遞迴展開至成本葉節點，由 `ordspe` 取得 `compri`、由 `ordqty` 取得 `stdqty`。
+7. 呼叫報價引擎計算成本與售價：`compri × stdqty × qty`，再套用報價率、折扣與稅。
+8. 顯示報價預覽。
+9. 使用者確認後產生正式報價（寫入 `ordqdt_ai` 快照）。
+10. 未來可由報價單轉成正式訂單。
+
+> `PRODUCT_PREFIX` 與 `REQUIRED_OPTNOS` 僅在新主檔資料尚未建立或無法取得時作為相容性 fallback；正式流程以 `invdoc`、`ordstr` 為權威來源。
 
 **核心原則：AI 負責理解需求、查詢資料、提出選項與確認；正式的產品組合、用量、價格與報價金額由程式與報價引擎決定，不由 LLM 自行猜測。**
 
@@ -93,7 +95,8 @@
                             ▼                          ▼
                        AI Agent 邏輯層 (agent/)
               • 意圖解析 (Intent Parsing)
-              • 缺項檢查 (Missing Field Check, 依 REQUIRED_OPTNOS)
+               • 產品類別與結構樹載入 (invdoc / ordstr)
+               • 缺項檢查 (Missing Node Check, 依 ordstr.must_chose)
               • Function Calling / Tool 派發
                             │
              ┌──────────────┴───────────────┐
@@ -104,9 +107,9 @@
       • get_part_quantity()
              └──────────────┬───────────────┘
                             ▼
-                  本機資料庫 (Local Database)
-      ordspd (選項定義) ─ ordspe (可選項目) ─ ordqty (部件用量)
-                            │
+                   本機資料庫 (Local Database)
+       invdoc ─ ordstr ─ ordspd ─ ordspe ─ ordqty
+                             │
                             ▼
                   ordqdt_ai (報價規格快照)
 ```
@@ -205,8 +208,10 @@ ai_quote_assistant/
 資料流：
 
 ```text
-ordspd (選項定義)
-  └─→ ordspe (可選項目，含 compri 採購成本)
+invdoc (產品類別、prodkind、quo_rate)
+  └─→ ordstr (結構樹、must_chose、seq)
+        └─→ ordspd (選項定義)
+              └─→ ordspe (可選項目，含 compri 採購成本)
         └─→ ordqty (部件用量 stdqty，依 path 對應)
               └─→ calculate_from_draft()
                     └─→ ordqdt_ai (報價選擇快照)
@@ -214,7 +219,7 @@ ordspd (選項定義)
 
 ### Path 路徑階層設計
 
-路徑格式為 `{PRODUCT_PREFIX}\{optno}`，例如：
+產品路徑通常為 `{prodkind}\{optno}`，例如：
 
 ```text
 CMT1\A001    ← 尺寸選項類別（在 ordspd 定義）
@@ -225,7 +230,7 @@ CMT1\S005    ← 工費選項類別
 
 `ordspe` 的每個項目（如 `60*120 桌面`、`美耐板`）都掛在對應的 `path` 下。`ordqty` 依相同 `path` 記錄標準用量（`stdqty`）。
 
-> **注意**：`PRODUCT_PREFIX` 需與真實資料庫的 `ordspd.path` 前綴一致（見 [`config.py`](config.py)）。
+> **注意**：正式流程的前綴由 `invdoc.prodkind` 取得；若 `invdoc` 不可用，才使用 [`config.py`](config.py) 的 `PRODUCT_PREFIX` fallback。
 
 ### 關鍵設計：主檔 vs. 快照
 
@@ -244,9 +249,13 @@ CMT1\S005    ← 工費選項類別
 NEW
  │ 使用者輸入需求
  ▼
-ANALYZING（Agent 解析需求，依 optno 分類選項）
+ANALYZING（Agent 解析需求）
  ▼
-CHECKING（依 REQUIRED_OPTNOS 檢查必要欄位）
+PRODUCT_SELECTED（查 invdoc，選定 prodkind 與 quo_rate）
+ ▼
+STRUCTURE_EXPANDED（以 ordstr 遞迴展開結構樹）
+ ▼
+CHECKING（依 ordstr.must_chose 檢查必要節點）
  ├── 缺少必要欄位 ─► WAITING_FOR_INPUT ─► （使用者補充）─┐
  └── 資料完整 ─────────────────────────────────────────┘
  ▼
@@ -263,7 +272,9 @@ SNAPSHOT_CREATED（寫入 ordqdt_ai）
 |---|---|
 | `NEW` | 尚未建立報價 |
 | `ANALYZING` | Agent 正在分析需求 |
-| `CHECKING` | 依 `REQUIRED_OPTNOS` 檢查必要欄位 |
+| `PRODUCT_SELECTED` | 已由 `invdoc` 選定產品類別與報價率 |
+| `STRUCTURE_EXPANDED` | 已由 `ordstr` 建立完整產品結構骨架 |
+| `CHECKING` | 依 `ordstr.must_chose` 檢查必要節點；無結構資料時才 fallback 至 `REQUIRED_OPTNOS` |
 | `WAITING_FOR_INPUT` | 等待使用者補充資訊 |
 | `PREVIEW` | 報價草稿已建立，可試算 |
 | `CONFIRMED` | 使用者已確認正式報價 |
@@ -274,8 +285,9 @@ SNAPSHOT_CREATED（寫入 ordqdt_ai）
 | Tool | 用途 |
 |---|---|
 | `search_product` | 依名稱或關鍵字搜尋產品 |
-| `get_product_parts` | 取得產品包含哪些部件（依 `PRODUCT_PREFIX` 路徑） |
+| `get_product_parts` | 取得產品包含哪些部件（正式流程依 `invdoc.prodkind` 路徑） |
 | `search_option` | 將自然語言轉成正式規格代碼 |
+| `get_options_by_path` | 取得結構節點下的合法選項，供顯示與確認 |
 | `get_part_quantity` | 取得部件標準用量（`stdqty`，依 path 查 ordqty） |
 | `calculate_quote` | 透過報價引擎計算價格 |
 | `preview_quote` | 產生尚未正式建立的報價預覽 |
@@ -406,7 +418,7 @@ streamlit run app.py
 
 啟動時系統自動：
 1. 建立 `dev.db`（SQLite 本機資料庫）
-2. 建立四張資料表（`ordspd` / `ordspe` / `ordqty` / `ordqdt_ai`）
+2. 建立本機報價資料表（包含 `invdoc` / `ordstr` / `ordspd` / `ordspe` / `ordqty` / `ordqdt_ai`；實際以目前 migration／seed 定義為準）
 3. 灌入 CMT1 辦公桌範例假資料（依真實 optno 結構：A001/S002/B001/S005）
 
 若需手動重置假資料：
@@ -498,7 +510,7 @@ WORKGROUP=CMT1
 
 ### MVP 第一版
 
-自然語言輸入 → 依 optno 搜尋產品／部件／規格 → 選擇產品組合 → 詢問缺少資訊 → 計算報價（compri × stdqty × qty）→ 顯示預覽 → 使用者確認 → 建立報價。
+自然語言輸入 → 查 `invdoc` 選產品類別 → 以 `ordstr` 展開結構樹 → 依 `must_chose` 詢問缺項 → 以 `ordspe`／`ordqty` 補成本與用量 → 計算報價（`compri × stdqty × qty`）→ 顯示預覽 → 使用者確認 → 建立報價。
 
 ### 第二階段
 

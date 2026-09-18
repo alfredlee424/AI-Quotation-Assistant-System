@@ -49,6 +49,8 @@ class QuoteStatus(str, Enum):
     """報價流程狀態"""
     NEW = "NEW"                          # 初始狀態，尚未建立報價
     ANALYZING = "ANALYZING"              # Agent 正在解析需求
+    PRODUCT_SELECTED = "PRODUCT_SELECTED"  # 已選定 invdoc 產品類別
+    STRUCTURE_EXPANDED = "STRUCTURE_EXPANDED"  # 已展開 ordstr 結構樹
     CHECKING = "CHECKING"                # 檢查必要欄位
     WAITING_FOR_INPUT = "WAITING_FOR_INPUT"  # 等待使用者補充資訊
     PREVIEW = "PREVIEW"                  # 報價草稿試算完成，等待確認
@@ -62,7 +64,9 @@ class QuoteStatus(str, Enum):
 # 合法狀態轉移表
 VALID_TRANSITIONS: dict[QuoteStatus, list[QuoteStatus]] = {
     QuoteStatus.NEW: [QuoteStatus.ANALYZING],
-    QuoteStatus.ANALYZING: [QuoteStatus.CHECKING, QuoteStatus.ERROR],
+    QuoteStatus.ANALYZING: [QuoteStatus.PRODUCT_SELECTED, QuoteStatus.CHECKING, QuoteStatus.ERROR],
+    QuoteStatus.PRODUCT_SELECTED: [QuoteStatus.STRUCTURE_EXPANDED, QuoteStatus.ERROR],
+    QuoteStatus.STRUCTURE_EXPANDED: [QuoteStatus.CHECKING, QuoteStatus.ERROR],
     QuoteStatus.CHECKING: [
         QuoteStatus.WAITING_FOR_INPUT,
         QuoteStatus.PREVIEW,
@@ -81,6 +85,8 @@ VALID_TRANSITIONS: dict[QuoteStatus, list[QuoteStatus]] = {
 STATUS_LABEL: dict[QuoteStatus, str] = {
     QuoteStatus.NEW: "未開始",
     QuoteStatus.ANALYZING: "分析需求中",
+    QuoteStatus.PRODUCT_SELECTED: "已選定產品類別",
+    QuoteStatus.STRUCTURE_EXPANDED: "已展開產品結構",
     QuoteStatus.CHECKING: "檢查欄位",
     QuoteStatus.WAITING_FOR_INPUT: "等待補充資訊",
     QuoteStatus.PREVIEW: "報價試算完成",
@@ -159,8 +165,8 @@ def check_missing_fields(quote_draft: dict) -> list[str]:
     """
     檢查報價草稿中缺少哪些必要欄位。
 
-    必填項目由 config.REQUIRED_OPTNOS 決定（如 ["A001"]），
-    表示至少要選完這些 optno 類別才能進入報價試算。
+    必填項目優先由 ordstr.must_chose 決定；沒有結構資料時，
+    才回退至 config.REQUIRED_OPTNOS。
     數量（qty）永遠必填。
 
     Returns:
@@ -172,18 +178,25 @@ def check_missing_fields(quote_draft: dict) -> list[str]:
     if not quote_draft.get("qty"):
         missing.append("數量")
 
-    # 依 REQUIRED_OPTNOS 檢查必填選項類別
     selections = quote_draft.get("selections", {})
-    for optno in REQUIRED_OPTNOS:
-        if optno not in selections:
-            # 嘗試從資料庫取得 optdesc 作為顯示名稱
-            try:
-                from database import repository as repo
-                cats = repo.get_all_option_categories()
-                cat_map = {c["optno"]: c["optdesc"] for c in cats}
-                label = cat_map.get(optno, optno)
-            except Exception:
-                label = optno
-            missing.append(label)
+    prodkind = str(quote_draft.get("prodkind", "")).strip()
+    required_nodes = []
+    if prodkind:
+        try:
+            from database import repository as repo
+            required_nodes = repo.get_required_nodes(prodkind)
+        except Exception:
+            required_nodes = []
+
+    if required_nodes:
+        chosen_paths = {str(v.get("path", "")).strip() for v in selections.values()}
+        for node in required_nodes:
+            path = str(node.get("pathc", "")).strip()
+            if path and path not in chosen_paths:
+                missing.append(node.get("dmark") or node.get("optnoc") or path)
+    else:
+        for optno in REQUIRED_OPTNOS:
+            if optno not in selections:
+                missing.append(optno)
 
     return missing

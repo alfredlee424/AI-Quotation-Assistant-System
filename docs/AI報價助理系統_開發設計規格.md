@@ -1,6 +1,6 @@
 # AI 報價助理系統－開發設計規格
 
-> 依據目前已確認的 `ordspd`、`ordspe`、`ordqty` 資料結構，以及「依產品部件與選擇項目產生報價」的需求整理。
+> 依據目前已確認的 `invdoc`、`ordstr`、`ordspd`、`ordspe`、`ordqty` 資料結構，以及「依產品結構與選擇項目產生報價」的需求整理。
 >
 > **核心原則：AI 負責理解需求、查詢資料、提出選項與確認；正式的產品組合、用量、價格與報價金額由程式與報價引擎決定，不由 LLM 自行猜測。**
 
@@ -15,12 +15,12 @@
 AI 應能：
 
 1. 理解客戶需求
-2. 找到對應產品
-3. 找出產品所需部件
-4. 找出各部件可選規格
+2. 從 `invdoc` 找到可報價產品類別並取得 `prodkind`／`quo_rate`
+3. 從 `ordstr` 遞迴展開產品所需結構與部件
+4. 找出各結構節點的資料庫合法規格
 5. 將自然語言轉成正式代碼
-6. 找出缺少的必要條件並詢問
-7. 依 `ordqty` 等資料計算部件需求量
+6. 依 `ordstr.must_chose` 找出缺少的必要條件並詢問
+7. 依 `ordspe` 與 `ordqty` 取得成本及部件需求量
 8. 呼叫報價引擎計算成本與售價
 9. 顯示報價預覽
 10. 使用者確認後產生正式報價單
@@ -45,7 +45,7 @@ LLM → 「我覺得應該報 8,000 元」
     ↓
 AI 理解
     ↓
-查詢產品 / 部件 / 選項
+    查詢產品類別 / 結構樹 / 選項
     ↓
 建立報價條件
     ↓
@@ -63,6 +63,7 @@ AI 不應直接執行 SQL，而應透過受控的 Business API / Tool：
 ```text
 search_product()
 get_product_parts()
+get_options_by_path()
 search_option()
 get_part_quantity()
 calculate_quote()
@@ -107,9 +108,13 @@ convert_to_order()
                           │
           ┌───────────────┼────────────────┐
           ▼               ▼                ▼
-       ordspd           ordspe           ordqty
-          │               │                │
-          └───────────────┼────────────────┘
+       invdoc          ordstr           ordspd
+      產品類別       結構樹/必選項目      選項定義
+           │               │                │
+           └───────────────┼────────────────┘
+                           ▼
+                    ordspe / ordqty
+                 成本項目 / 標準用量
                           ▼
                         ordqdt_ai
                           │
@@ -124,7 +129,15 @@ convert_to_order()
 
 # 4. 現有資料表在 AI 報價中的角色
 
-## 4.1 `ordspd`
+## 4.1 `invdoc`
+
+產品類別主檔。報價開始時以 `ordkind=1` 與 `workgroup` 查詢可報價產品，使用者選定 `prodkind` 後，該欄位也會成為產品結構路徑前綴；`quo_rate` 是該產品的報價率。
+
+## 4.2 `ordstr`
+
+產品結構／必選項目樹，採父子鄰接邊表保存 `pathf → pathc`。系統必須從產品根節點遞迴展開所有子節點，依 `seq` 排序，並以 `must_chose=Y` 作為缺項檢查的權威來源。父節點只負責分類，成本通常位於更深層的葉節點。
+
+## 4.3 `ordspd`
 
 目前截圖顯示為資料字典／選項定義檔：
 
@@ -164,7 +177,7 @@ AI 不應自行猜測 `CLMT`，而應由資料庫查出。
 
 ---
 
-## 4.2 `ordspe`
+## 4.4 `ordspe`
 
 目前截圖顯示：
 
@@ -348,18 +361,22 @@ amount
 # 7. 完整資料關係
 
 ```text
-                         Product
+                         invdoc
+                    產品類別 / quo_rate
                             │
                             ▼
-                         ordqty
-                     部件 / 用量規則
+                         ordstr
+                    結構樹 / 必選項目
                             │
               ┌─────────────┴─────────────┐
               ▼                           ▼
            ordspd                       ordspe
-        選項定義                       選項項目
+        選項定義                       選項項目/成本
               │                           │
               └─────────────┬─────────────┘
+                            ▼
+                          ordqty
+                       部件 / 標準用量
                             ▼
                           ordqdt_ai
                        報價選擇快照
@@ -381,11 +398,11 @@ amount
 
 # 8. AI Agent Tool 設計
 
-第一版建議建立以下 Tool。
+第一版建議建立以下 Tool。Tool 只能回傳資料庫中存在的產品、節點與規格；LLM 不得自行產生代碼、結構節點或價格。
 
 ## 8.1 `search_product`
 
-用途：根據產品名稱或關鍵字搜尋產品。
+用途：根據產品名稱或關鍵字搜尋 `invdoc` 可報價產品類別；正式流程限定 `ordkind=1`。
 
 ```json
 {
@@ -397,11 +414,11 @@ amount
 
 ## 8.2 `get_product_parts`
 
-取得產品包含哪些部件。
+取得選定 `prodkind` 的 `ordstr` 結構，實作上需遞迴展開父子節點。
 
 ```json
 {
-  "product_code": "A001"
+  "product_code": "CMT1"
 }
 ```
 
@@ -409,7 +426,7 @@ amount
 
 ## 8.3 `search_option`
 
-將自然語言轉成正式規格。
+將自然語言對照目前結構節點的合法選項，轉成正式規格。模糊候選必須先取得使用者確認。
 
 ```json
 {
@@ -430,7 +447,7 @@ amount
 
 ## 8.4 `get_part_quantity`
 
-取得部件標準用量。
+依成本葉節點與驅動根節點代碼取得 `ordqty.stdqty`。
 
 ```json
 {
@@ -492,6 +509,8 @@ amount
 
 # 9. AI 報價流程
 
+新的報價流程以 [`docs/改善後報價流程.md`](改善後報價流程.md) 為準。LLM 只負責理解自然語言、提出資料庫候選與詢問缺項；產品結構、必選完整性、成本葉節點與金額均由程式及資料庫決定。
+
 ```text
 使用者
   │
@@ -500,10 +519,11 @@ amount
   ▼
 AI Agent
   │
-  ├── search_product()
-  ├── get_product_parts()
-  ├── search_option()
-  └── get_part_quantity()
+  ├── search_product() → 查 invdoc，選定 prodkind / quo_rate
+  ├── get_product_parts() → 以 ordstr 遞迴展開結構樹
+  ├── get_options_by_path() → 取得目前節點合法選項
+  ├── search_option() → 對照資料庫正式代碼
+  └── get_part_quantity() → 取得 ordqty 標準用量
   │
   ▼
 建立報價條件
@@ -516,7 +536,7 @@ AI Agent
   └── 數量
   │
   ▼
-檢查必要欄位
+依 ordstr.must_chose 檢查結構必選節點
   │
   ├── 缺資料 → 問使用者
   │
@@ -546,6 +566,8 @@ calculate_quote()
 
 # 10. 缺少條件的處理
 
+缺項檢查不是只檢查固定欄位名稱，也不是只依賴 LLM 判斷。程式先依 `ordstr.must_chose=Y` 與 `seq` 找出目前產品結構中尚未選定的節點，再將節點名稱與合法選項交給 LLM 轉成自然語言問題。若沒有 `ordstr` 資料，才回退至 `REQUIRED_OPTNOS`。
+
 例如：
 
 > 我要 100 張桌子，美耐板。
@@ -554,10 +576,9 @@ AI 應先檢查：
 
 ```text
 ✓ 數量
-✓ 材質
-✗ 尺寸
-✗ 外型
-✗ 腳架
+✓ 已對應的結構節點選擇
+✗ ordstr 標記的必選尺寸節點
+✗ ordstr 標記的必選腳架節點
 ```
 
 然後詢問：
@@ -585,7 +606,7 @@ AI 可能收到：
 1200x600
 ```
 
-不能直接把文字寫入正式報價，而應查詢：
+不能直接把文字寫入正式報價，而應依目前 `ordstr` 節點的 `path` 查詢合法選項，再由 `search_option()` 或 `get_options_by_path()` 對照：
 
 ```text
 白色
@@ -613,14 +634,17 @@ search_option()
 SIZE1200600
 ```
 
-最後形成正式條件：
+最後形成以結構節點為 key 的正式條件；實際欄位應保留完整 `path`、`code`、`codsc` 與成本資料，避免不同樹枝下相同選項代碼互相覆蓋：
 
 ```json
 {
-  "color_code": "WHITE",
-  "material_code": "CLMT",
-  "leg_code": "LEG",
-  "size_code": "SIZE1200600"
+  "prodkind": "CMT1",
+  "quo_rate": 1.30,
+  "selections": {
+    "A001": {"path": "CMT1\\A001", "code": "C001"},
+    "A001\\S004": {"path": "CMT1\\A001\\S004", "code": "C001"},
+    "B001": {"path": "CMT1\\B001", "code": "C001"}
+  }
 }
 ```
 
@@ -635,11 +659,11 @@ SIZE1200600
    ↓
 產品
    ↓
-部件
+    ordstr 遞迴展開至成本葉節點
    ↓
 標準用量
    ↓
-採購價格
+    ordspe.compri
    ↓
 成本
    ↓
@@ -653,7 +677,7 @@ SIZE1200600
    ↓
 稅
    ↓
-最終報價
+    invdoc.quo_rate 加成後的最終報價
 ```
 
 例如：
@@ -684,6 +708,8 @@ SIZE1200600
 ```text
 19,600
 ```
+
+材料與工費成本依 `compri × stdqty × qty` 計算，再依選定產品的 `invdoc.quo_rate` 加成，最後套用折扣與稅率。若 `invdoc` 尚無資料，才使用設定檔中的 fallback 報價率。
 
 再依公司正式規則計算：
 
@@ -978,6 +1004,7 @@ AI 不直接碰資料庫，而是呼叫這些 API。
 ```text
 search_product
 get_product_parts
+get_options_by_path
 search_option
 get_part_quantity
 calculate_quote

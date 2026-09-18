@@ -247,9 +247,10 @@ class LLMAgent:
             "1. 你不得自行猜測或計算任何金額，所有價格必須透過 calculate_quote 工具計算\n"
             "2. 你不得自行猜測產品代碼，必須透過 search_option 工具查詢正式代碼\n"
             "3. 程式提供 allowed_options 時，只能列出其中的選項，不得自行新增或修改\n"
-            "4. 資料不完整時，必須主動詢問使用者補充（數量、桌面尺寸等必填項）\n"
-            "5. 所有回覆使用繁體中文\n"
-            "6. 建立正式報價前，必須明確取得使用者確認\n\n"
+            "4. 必須先從 invdoc 選定 prodkind 與 quo_rate，不能自行猜產品\n"
+            "5. 資料不完整時，必須依 ordstr.must_chose 主動詢問使用者補充\n"
+            "6. 所有回覆使用繁體中文\n"
+            "7. 建立正式報價前，必須明確取得使用者確認\n\n"
             "7. ordspd 的 optno 是獨立選項類別，不是互斥產品型號。A001=桌面尺寸、"
             "B001=木腳、B002=鐵腳、C001=轉盤尺寸可以依資料庫規則同時存在；"
             "不可因為 path 分別是 CMT1\\A001 與 CMT1\\B001 就判定不能混搭。\n"
@@ -257,8 +258,8 @@ class LLMAgent:
             "也不要自行產生如『2317胡桃美耐板』這類資料庫不存在的規格。"
             "注意：ordspd.optno（例如 C001）與 ordspe.code（例如各 path 下的 C001）是不同欄位，"
             "不可混為一談。\n\n"
-            f"產品路徑格式：{{PRODUCT_PREFIX}}\\{{optno}}，例如 {PRODUCT_PREFIX}\\A001\n"
-            "你可以使用以下工具：search_option、get_options_by_path、"
+            "產品路徑格式：{prodkind}\\{optno}，例如 CMT1\\A001\n"
+            "你可以使用以下工具：get_product_categories、search_product、search_option、get_options_by_path、"
             "get_part_quantity、calculate_quote、preview_quote"
         )
 
@@ -281,6 +282,11 @@ class LLMAgent:
         # 取消
         if is_cancel(user_input):
             return "已取消目前報價，請重新輸入需求。", new_quote_draft()
+
+        product_error = self._prepare_product_context(user_input, quote_draft)
+        if product_error:
+            quote_draft["status"] = QuoteStatus.WAITING_FOR_INPUT
+            return product_error, quote_draft
 
         # 模糊候選必須先由使用者確認，確認後才允許寫入草稿。
         pending = quote_draft.get("pending_options", [])
@@ -309,6 +315,8 @@ class LLMAgent:
         missing = check_missing_fields(quote_draft)
         missing_options = self._get_missing_options(quote_draft, missing)
         quote_draft["missing_fields"] = missing
+        if quote_draft.get("prodkind"):
+            quote_draft["status"] = QuoteStatus.STRUCTURE_EXPANDED
 
         # 標準規格已由程式完成所有必要條件時，直接使用正式報價引擎試算，
         # 不依賴 LLM 是否正確呼叫 preview_quote，確保按鈕可立即顯示報價。
@@ -470,21 +478,64 @@ class LLMAgent:
         return None
 
     def _get_missing_options(self, quote_draft: dict, missing: list[str]) -> dict[str, list[dict]]:
-        """依缺漏 optno 查詢資料庫選項，建立給 LLM 與 UI 使用的白名單。"""
+        """依 ordstr 缺漏節點查詢資料庫選項，建立白名單。"""
         from config import REQUIRED_OPTNOS
         from database import repository as repo
 
         selections = quote_draft.get("selections", {})
-        missing_optnos = [optno for optno in REQUIRED_OPTNOS if optno not in selections]
         if not missing:
             return {}
 
         result: dict[str, list[dict]] = {}
-        for optno in missing_optnos:
-            path = repo.build_option_path(optno)
-            result[optno] = repo.get_options_by_path(path)
+        prodkind = str(quote_draft.get("prodkind", PRODUCT_PREFIX)).strip() or PRODUCT_PREFIX
+        required_nodes = repo.get_required_nodes(prodkind)
+        chosen_paths = {str(v.get("path", "")).strip() for v in selections.values()}
+        if required_nodes:
+            for node in required_nodes:
+                path = str(node.get("pathc", "")).strip()
+                if path and path not in chosen_paths:
+                    result[path] = repo.get_options_by_path(path)
+        else:
+            for optno in REQUIRED_OPTNOS:
+                if optno not in selections:
+                    result[optno] = repo.get_options_by_path(repo.build_option_path(optno))
         quote_draft["allowed_options"] = result
         return result
+
+    @staticmethod
+    def _prepare_product_context(user_input: str, quote_draft: dict) -> str | None:
+        """從 invdoc 選定產品類別並保存 prodkind/quo_rate。"""
+        from database import repository as repo
+
+        if quote_draft.get("prodkind"):
+            return None
+        try:
+            categories = repo.get_product_categories()
+        except Exception:
+            categories = []
+        if not categories:
+            quote_draft["prodkind"] = PRODUCT_PREFIX
+            return None
+        text = user_input.strip().lower()
+        matched = [
+            c for c in categories
+            if str(c.get("prodkind", "")).lower() in text
+            or str(c.get("codsc", "")).lower() in text
+        ]
+        if len(categories) == 1 and not matched:
+            matched = categories
+        if len(matched) != 1:
+            quote_draft["product_options"] = categories if not matched else matched
+            names = "、".join(
+                f"{c.get('codsc') or c.get('prodkind')}（{c.get('prodkind')}）"
+                for c in quote_draft["product_options"]
+            )
+            return "請先選擇報價產品類別：" + names
+        category = matched[0]
+        quote_draft["prodkind"] = category["prodkind"]
+        quote_draft["product_name"] = category.get("codsc") or category["prodkind"]
+        quote_draft["quo_rate"] = category.get("quo_rate")
+        return None
 
     def _update_draft_from_option(self, result: dict, quote_draft: dict) -> None:
         """

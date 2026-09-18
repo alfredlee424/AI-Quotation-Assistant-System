@@ -35,8 +35,34 @@ def search_product(keyword: str, workgroup: str = WORKGROUP) -> dict:
     Returns:
         {"results": [...], "count": int}
     """
+    try:
+        categories = repo.get_product_categories(workgroup=workgroup)
+    except Exception:
+        categories = []
+    keyword_norm = keyword.strip().lower()
+    matched_categories = [
+        item for item in categories
+        if not keyword_norm
+        or keyword_norm in str(item.get("prodkind", "")).lower()
+        or keyword_norm in str(item.get("codsc", "")).lower()
+    ]
+    # Product discovery is invdoc-first. Keep the legacy option results only
+    # as an explicit fallback for installations without invdoc data.
+    if categories:
+        return {
+            "results": matched_categories,
+            "count": len(matched_categories),
+            "source": "invdoc",
+            "requires_selection": len(matched_categories) != 1,
+        }
     results = repo.search_product(keyword=keyword, workgroup=workgroup)
-    return {"results": results, "count": len(results)}
+    return {"results": results, "count": len(results), "source": "ordspe"}
+
+
+def get_product_categories(workgroup: str = WORKGROUP) -> dict:
+    """取得 invdoc ordkind=1 的可報價產品類別。"""
+    results = repo.get_product_categories(workgroup=workgroup)
+    return {"results": results, "count": len(results), "source": "invdoc"}
 
 
 def get_product_parts(product_path: str, workgroup: str = WORKGROUP) -> dict:
@@ -49,8 +75,16 @@ def get_product_parts(product_path: str, workgroup: str = WORKGROUP) -> dict:
     Returns:
         {"parts": [...], "count": int}
     """
+    structure = repo.expand_ordstr_tree(product_path, workgroup=workgroup)
+    if structure:
+        return {
+            "structure": structure,
+            "parts": [node for node in structure if node.get("is_leaf")],
+            "count": len(structure),
+            "source": "ordstr",
+        }
     parts = repo.get_product_parts(product_path=product_path, workgroup=workgroup)
-    return {"parts": parts, "count": len(parts)}
+    return {"parts": parts, "count": len(parts), "source": "ordqty"}
 
 
 def search_option(keyword: str, workgroup: str = WORKGROUP) -> dict:
@@ -131,7 +165,17 @@ def calculate_quote(quote_draft: dict) -> dict:
     if not validation["valid"]:
         raise ValueError("報價規格驗證失敗：" + "；".join(validation["errors"]))
 
-    calc = calculate_from_draft(quote_draft)
+    prodkind = str(quote_draft.get("prodkind", "")).strip()
+    if prodkind and repo.expand_ordstr_tree(prodkind):
+        from engine.calculator import calculate_from_ordstr
+        calc = calculate_from_ordstr(
+            prodkind,
+            quote_draft.get("selections", {}),
+            qty=float(quote_draft.get("qty", 1)),
+            discount_rate=float(quote_draft.get("discount_rate", 0.0)),
+        )
+    else:
+        calc = calculate_from_draft(quote_draft)
     return {
         "total_cost": calc.total_cost,
         "subtotal": calc.subtotal,
@@ -202,7 +246,17 @@ def create_quote(quote_draft: dict, user: str = "SYS") -> dict:
     if not validation["valid"]:
         raise ValueError("報價規格驗證失敗：" + "；".join(validation["errors"]))
 
-    calc = calculate_from_draft(quote_draft)
+    prodkind = str(quote_draft.get("prodkind", "")).strip()
+    from engine.calculator import calculate_from_ordstr
+    if prodkind and repo.expand_ordstr_tree(prodkind):
+        calc = calculate_from_ordstr(
+            prodkind,
+            quote_draft.get("selections", {}),
+            qty=float(quote_draft.get("qty", 1)),
+            discount_rate=float(quote_draft.get("discount_rate", 0.0)),
+        )
+    else:
+        calc = calculate_from_draft(quote_draft)
     ref_no = create_quote_snapshot(calc_result=calc, quote_draft=quote_draft, user=user)
 
     return {
@@ -253,13 +307,14 @@ def validate_quote_draft(quote_draft: dict) -> dict:
             errors.append(f"{key} 缺少 path 或 code")
             continue
 
-        if not path.startswith(f"{PRODUCT_PREFIX}\\"):
-            errors.append(f"{path} 不屬於目前產品 {PRODUCT_PREFIX}")
+        prefix = prodkind or PRODUCT_PREFIX
+        if not path.startswith(f"{prefix}\\"):
+            errors.append(f"{path} 不屬於目前產品 {prefix}")
             continue
 
         # 子部件的 selection 會以自身 optno 為識別（例如
         # CMT1\A001\S004 → S004），不能只取產品路徑下的第一段 A001。
-        path_parts = path.removeprefix(f"{PRODUCT_PREFIX}\\").split("\\")
+        path_parts = path.removeprefix(f"{prefix}\\").split("\\")
         path_optno = path_parts[-1] if path_parts else ""
         if optno and path_optno and optno != path_optno:
             errors.append(f"{path} 與 optno {optno} 不一致")
@@ -286,8 +341,16 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_product_categories",
+            "description": "取得 invdoc 中 ordkind=1 的可報價產品類別、產品前綴與報價率",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_product",
-            "description": "依關鍵字搜尋產品或選項，用於找到對應的正式代碼",
+            "description": "依關鍵字搜尋 invdoc 可報價產品類別；只有 invdoc 無資料時才回退搜尋選項",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -392,6 +455,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
 # ============================================================
 
 TOOL_REGISTRY: dict[str, Any] = {
+    "get_product_categories": get_product_categories,
     "search_product": search_product,
     "get_product_parts": get_product_parts,
     "search_option": search_option,

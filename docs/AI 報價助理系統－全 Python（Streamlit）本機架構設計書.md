@@ -48,7 +48,8 @@
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        本機資料庫 (Local Database)                     │
 │                                                                         │
-│  ordspd (選項定義) ─── ordspe (可選項目) ─── ordqty (部件用量)         │
+│  invdoc ─ ordstr ─ ordspd ─ ordspe ─ ordqty                         │
+│  產品類別  結構樹  選項定義  可選項目  部件用量                         │
 │                                      │                                  │
 │                                      ▼                                  │
 │                            ordqdt_ai (報價規格快照)                        │
@@ -148,7 +149,7 @@ AI Agent 主要負責「理解需求」與「調用工具」，**不負責金額
 
 #### 缺項提醒
 
-檢查必要的產品與選配條件是否完整。
+依 `ordstr.must_chose=Y` 檢查目前產品結構的必要節點，並依 `ordstr.seq` 排序提示；沒有 `ordstr` 資料時才回退至 `REQUIRED_OPTNOS`。
 
 若資料不足，Agent 應提示使用者補充，例如：
 
@@ -261,9 +262,15 @@ ANALYZING
  │
  │ Agent 解析需求
  ▼
+PRODUCT_SELECTED
+ │ 查 invdoc 選定 prodkind 與 quo_rate
+ ▼
+STRUCTURE_EXPANDED
+ │ 以 ordstr 遞迴展開完整結構樹
+ ▼
 CHECKING
- │
- ├── 缺少必要欄位 ──► WAITING_FOR_INPUT
+ │ 依 ordstr.must_chose 檢查
+ ├── 缺少必要節點 ──► WAITING_FOR_INPUT
  │                         │
  │                         │ 使用者補充
  │                         └──────────────┐

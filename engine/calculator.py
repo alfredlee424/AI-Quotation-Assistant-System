@@ -455,7 +455,14 @@ def calculate_from_ordstr(
         optnoc = str(node.get("optnoc", "")).strip()
 
         # 葉節點對應的使用者選擇（以 optnoc 對 selections key）
-        sel = selections.get(optnoc, {})
+        # 新流程可用 optno、相對 path 或完整 path 作為 selection key；
+        # 優先取最精確的路徑，兼容既有 optno key 草稿。
+        relative_path = path.removeprefix(f"{prefix}\\")
+        sel = (
+            selections.get(path)
+            or selections.get(relative_path)
+            or selections.get(optnoc, {})
+        )
         code = str(sel.get("code", "")).strip()
         codsc = str(sel.get("codsc", "")).strip()
         optdesc = str(sel.get("optdesc", "")).strip()
