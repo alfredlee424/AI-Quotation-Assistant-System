@@ -123,3 +123,30 @@ def test_ui_render_never_recalculates_and_import_passes_explicit_product_qty():
     saves = [node for node in named if node.func.id == "create_quote"]
     assert len(saves) == 1
     assert "preview_id" in {keyword.arg for keyword in saves[0].keywords}
+
+
+def test_ui_displays_selected_draft_lines_before_calculation(current_draft, cmt1_db):
+    from agent.state import check_missing_fields
+    from engine.configuration import apply_proposal
+    from utils.helpers import quote_selections_list
+
+    current_draft["selections"].pop(r"CMT1\A001\S010")
+    apply_proposal(current_draft, {"changes": [], "questions": []})
+    check_missing_fields(current_draft)
+    assert not current_draft.get("calc_result")
+    tree = ast.parse(APP.read_text(encoding="utf-8"))
+    nodes = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+             and ast.unparse(n.test) == "not calc_result and sel_list"]
+    assert len(nodes) == 1
+    st = Mock()
+    block = ast.Module(body=nodes, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(block), str(APP), "exec"), {
+        "st": st, "calc_result": None, "sel_list": quote_selections_list(current_draft),
+    })
+    st.dataframe.assert_called_once()
+    rows = st.dataframe.call_args.args[0]
+    assert any(r["規格"] == "817胡桃木" for r in rows)
+    assert all(set(r) == {"部件", "規格", "每件產品用量"} for r in rows)
+    assert all("CMT1\\" not in r["部件"] for r in rows)
+    with cmt1_db() as db:
+        assert db.query(ordqdt_ai).count() == 0

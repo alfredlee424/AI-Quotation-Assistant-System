@@ -8,7 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from config import (
     USE_LLM, USE_AZURE, OPENAI_API_KEY, OPENAI_MODEL, WORKGROUP,
@@ -23,8 +23,10 @@ from agent.state import QuoteStatus, check_missing_fields, new_quote_draft
 from agent.tools import preview_quote
 from agent.rule_parser import (
     parse_and_update, format_missing_prompt, format_candidate_confirmation,
-    select_candidate, is_confirm, is_cancel,
+    select_candidate, is_candidate_reply, is_confirm, is_cancel,
 )
+from utils.logger import log_action
+from utils.option_labels import candidate_label, open_question
 
 
 PROPOSAL_TOOL = {
@@ -62,8 +64,28 @@ PROPOSAL_TOOL = {
 # 僅保留提案 schema；不得使用 agent.tools 的執行型工具清單。
 TOOLS_SCHEMA = [PROPOSAL_TOOL]
 
+# 問題複核仍用同一提案介面，但不准改規格、數量或價格。
+QUESTION_REVIEW_TOOL = deepcopy(PROPOSAL_TOOL)
+QUESTION_REVIEW_TOOL["function"]["description"] = "只複核舊問題；changes 必須為空，questions 原文保留尚未解決的問題。"
+QUESTION_REVIEW_TOOL["function"]["parameters"]["properties"] = {
+    "changes": {"type": "array", "items": {"type": "object"}, "maxItems": 0},
+    "questions": {"type": "array", "items": {"type": "string"}},
+}
+
+QUESTION_REVIEW_PROMPT = """你只負責複核家具需求的舊問題，不是重新選配。
+根據已驗證的目前選擇與使用者回答，逐一判斷原問題是否已解決。
+changes 必須為空；questions 只保留尚未解決的原問題（逐字保留），不能新增或改寫。
+只有具體規格已回答原問題才可移除。必選齊全本身不代表所有需求都已釐清。
+protected_questions 必須保留：規格選擇不代表確認配件用量或匯入警告。
+不可用預設 line_qty=1 推論使用者已確認用量；不明確就保留原問題。
+不得修改產品、規格、數量、價格或建立報價。只呼叫 propose_quote_changes 一次。
+"""
+
 SYSTEM_PROMPT = r"""你是繁體中文家具需求理解助理，只能呼叫 propose_quote_changes 一次。
 本回合 current_draft 是目前狀態；歷史訊息僅供語意參考，不可還原舊選擇。
+focused_question 是目前使用者正在回答的候選群組，不要把短回答套到其他部件。
+allowed_options / pending_options 是尚待選擇的規格；已由使用者回答的問題不可重複提出。
+questions 只保留尚未釐清的需求；程式會詢問結構缺項，不必用通用歧義問題取代具體提案。
 從 categories 選產品；set 只可使用 catalogs 的完整 path 及該 path 的 code。
 remove 可使用 current_draft 已存在的完整 path（包含已退休的歷史路徑）。
 不得猜測產品、規格、數量、預設值，不得產生價格、成本、SQL 或呼叫建立報價。
@@ -103,19 +125,49 @@ def _control_input(text: str, draft: dict) -> Optional[tuple[str, dict]]:
     return None
 
 
-def _allowed_proposal(text: str, draft: dict) -> Optional[dict]:
-    """編號只對第一組提示生效，分支候選使用自身 path 而非容器 path。"""
-    match = re.fullmatch(r"(?:第\s*)?(\d+)(?:\s*[個項號])?", text.strip())
+def _current_candidates(draft: dict) -> tuple[Optional[str], list[dict]]:
+    """與畫面相同：歧義候選優先，否則只取第一組缺項。"""
     allowed = draft.get("allowed_options") or {}
-    if not match or not allowed or draft.get("pending_options"):
+    parent, options = next(iter(allowed.items()), (None, []))
+    if draft.get("pending_options"):
+        parent, options = None, draft["pending_options"]
+    labels = draft.get("option_labels", {})
+    return parent, [dict(o, path=o.get("path") or parent,
+                         display_path=labels.get(o.get("path") or parent) or o.get("display_path", ""))
+                    for o in options]
+
+
+def _allowed_proposal(text: str, draft: dict) -> Optional[dict]:
+    """目前候選唯一命中後直接提出已驗證路徑，不依賴模型重判。"""
+    parent, options = _current_candidates(draft)
+    option = select_candidate(text, options)
+    log_action("quote_selection_route", params={
+        "revision": draft.get("revision", 0), "input_length": len(text),
+        "first_group": parent, "candidate_count": len(options),
+        "pending_count": len(draft.get("pending_options") or []),
+    }, result={
+        "shortcut_eligible": option is not None,
+        "selected_path": option.get("path") if option else None,
+        "selected_code": option.get("code") if option else None,
+    })
+    if option is None:
         return None
-    parent, options = next(iter(allowed.items()))
-    index = int(match.group(1)) - 1
-    if not 0 <= index < len(options):
+    # 選擇規格不代表確認其他配件數量或匯入警告；不得清空無關問題。
+    questions = [q for q in draft.get("questions", [])
+                 if not (draft.get("pending_options") and q == "請選擇明確的規格與路徑。")]
+    change = {"op": "set", "path": option.get("path") or parent, "code": option.get("code", "")}
+    if "line_qty" in option:
+        change["line_qty"] = option["line_qty"]
+    return {"changes": [change], "questions": questions}
+
+
+def _unmatched_choice(text: str, draft: dict) -> Optional[tuple[str, dict]]:
+    _, options = _current_candidates(draft)
+    if not is_candidate_reply(text, options):
         return None
-    option = options[index]
-    return {"changes": [{"op": "set", "path": option.get("path") or parent,
-                         "code": option.get("code", "")}], "questions": []}
+    prompt = format_candidate_confirmation(options) if draft.get("pending_options") else format_missing_prompt(
+        draft.get("missing_fields", []), draft, draft.get("allowed_options"))
+    return _waiting(draft, "未能唯一對應目前選項；請確認編號與名稱一致，同名規格請使用編號。\n\n" + prompt)
 
 
 def _apply_allowed_option(user_input: str, quote_draft: dict) -> bool:
@@ -173,40 +225,76 @@ def _validate_proposal(proposal: dict) -> None:
             raise ValueError("每件產品的項目數量必須為數值")
 
 
-def _finish_turn(draft: dict) -> tuple[str, dict]:
+def _finish_turn(draft: dict, review_questions: Optional[Callable[[dict], bool]] = None) -> tuple[str, dict]:
     """成功提案後一律重新解析，只有程式試算成功才會有 PREVIEW。"""
     missing = check_missing_fields(draft)
+    log_action("quote_turn_resolution", result={
+        "revision": draft.get("revision", 0),
+        "selection_count": len(draft.get("selections", {})),
+        "question_count": len(draft.get("questions") or []),
+        "questions": draft.get("questions", []),
+        "pending_count": len(draft.get("pending_options") or []),
+        "missing_fields": missing,
+        "allowed_groups": list(draft.get("allowed_options") or {}),
+    })
     if draft.get("pending_options"):
-        return _waiting(draft, format_candidate_confirmation(draft["pending_options"]))
-    if draft.get("questions"):
-        # 不把模型自由文字（可能含捏造價格）直接呈現給使用者。
-        prompt = "需求仍有歧義，請補充欲修改的部件、完整規格及每件產品的配件數量。"
-        if missing:
-            prompt += "\n\n" + format_missing_prompt(missing, draft, draft.get("allowed_options"))
-        return _waiting(draft, prompt)
+        return _waiting(draft, format_candidate_confirmation(_current_candidates(draft)[1]))
     if missing:
+        # 已知結構缺項優先具體追問，不再每輪重複通用的歧義警告。
         return _waiting(draft, format_missing_prompt(missing, draft, draft.get("allowed_options")))
+    if draft.get("questions"):
+        if review_questions is not None and not review_questions(draft):
+            return _waiting(draft, "規格已保存，問題檢查暫時失敗；請稍後輸入「重新檢查」。")
+        if draft.get("questions"):
+            return _waiting(draft, open_question(draft["questions"][0], draft.get("option_labels", {})))
     try:
         preview = preview_quote(draft)
     except ValueError as exc:
         return _waiting(draft, f"目前無法產生報價預覽：{exc}")
     # 固定預覽與狀態由 preview_quote 建立，不能自行偽造 PREVIEW。
-    return preview["summary"] + "\n\n請確認右側預覽後按下「確定建立」，或繼續修改規格。", draft
+    calc = preview["calc"]
+    return (f"試算完成。成本：{calc['total_cost']:,.2f}；含稅報價：{calc['total_price']:,.2f}。\n\n"
+            "請查看右側明細，確認後按「確定建立」。"), draft
 
 
-def _submit_proposal(draft: dict, proposal: dict) -> tuple[str, dict]:
+def _submit_proposal(draft: dict, proposal: dict,
+                     review_questions: Optional[Callable[[dict], bool]] = None) -> tuple[str, dict]:
     _validate_proposal(proposal)
+    log_action("quote_proposal_validated", params={
+        "revision": draft.get("revision", 0),
+        "changes": proposal.get("changes", []),
+        "question_count": len(proposal.get("questions") or []),
+        "questions": proposal.get("questions", []),
+    })
     if not proposal.get("changes") and not any(k in proposal for k in ("prodkind", "qty", "discount_rate")):
-        if not proposal.get("questions"):
+        if not proposal.get("questions") and not draft.get("questions"):
             return _waiting(draft, "尚未取得明確的需求變更，請指定欲修改的規格或數量。")
     if not (proposal.get("prodkind") or draft.get("prodkind")):
         return _waiting(draft, _product_prompt(draft.get("product_options", [])))
+    before = normalize_selections(draft.get("selections", {}))
     apply_proposal(draft, proposal)
-    return _finish_turn(draft)
+    after = normalize_selections(draft.get("selections", {}))
+    log_action("quote_proposal_applied", result={
+        "revision": draft.get("revision", 0),
+        "added_paths": [p for p in after if p not in before],
+        "removed_paths": [p for p in before if p not in after],
+        "changed_paths": [p for p in after if p in before and
+                          (after[p]["code"], after[p]["line_qty"]) !=
+                          (before[p]["code"], before[p]["line_qty"])],
+        "selection_count": len(after),
+        "question_count": len(draft.get("questions") or []),
+    })
+    message, draft = _finish_turn(draft, review_questions)
+    confirmed = [candidate_label(dict(after[c["path"]],
+                                     display_path=draft.get("option_labels", {}).get(c["path"], "")), compact=True)
+                 for c in proposal.get("changes", []) if c["op"] == "set" and c["path"] in after]
+    if confirmed:
+        message = "已選：" + "、".join(confirmed[:3]) + (f"等 {len(confirmed)} 項" if len(confirmed) > 3 else "") + "。\n\n" + message
+    return message, draft
 
 
 def _product_prompt(categories: list[dict]) -> str:
-    names = "、".join(f"{c.get('codsc') or c.get('prodkind')}（{c.get('prodkind')}）" for c in categories)
+    names = "、".join(c.get("codsc") or "未命名產品" for c in categories)
     return "請先選擇報價產品類別：" + (names or "目前沒有可報價的產品類別，請確認產品主檔。")
 
 
@@ -222,6 +310,9 @@ class RuleBasedAgent:
         try:
             if shortcut is not None:
                 return _submit_proposal(quote_draft, shortcut)
+            unmatched = _unmatched_choice(user_input, quote_draft)
+            if unmatched is not None:
+                return unmatched
             working = deepcopy(quote_draft)
             product_error = LLMAgent._prepare_product_context(user_input, working)
             if product_error:
@@ -273,6 +364,64 @@ class LLMAgent:
             self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.system_prompt = SYSTEM_PROMPT
 
+    def _review_questions(self, draft: dict, messages: list[dict], user_input: str) -> bool:
+        """只複核舊問題，不呼叫 apply_proposal；失敗保留已選規格及全部問題。"""
+        questions = list(draft.get("questions") or [])
+        # 用量與匯入疑義必須由使用者另行回答，不能只因結構齊全而刪除。
+        protected = [q for q in questions if re.search(
+            r"數量|用量|個數|總數|總量|每件|每張|幾個|幾件|幾張|匯入|來源|警告", q)]
+        if draft.get("imported_quote", {}).get("warnings"):
+            protected = questions[:]
+        log_action("quote_questions_review_started", params={
+            "revision": draft.get("revision", 0), "questions": questions,
+            "protected_questions": protected,
+        })
+        if len(protected) == len(questions):
+            log_action("quote_questions_review_finished", result={
+                "removed_questions": [], "remaining_questions": questions, "source": "protected",
+            })
+            return True
+        selections = normalize_selections(draft.get("selections", {}))
+        context = {
+            "questions": questions, "protected_questions": protected,
+            "current_draft": {"prodkind": draft.get("prodkind"), "qty": draft.get("qty"),
+                              "selections": {p: {k: s.get(k) for k in
+                                             ("code", "codsc", "line_qty", "automatic")}
+                                             for p, s in selections.items()}},
+            "user_answers": [m["content"] for m in (messages or [])
+                             if m.get("role") == "user" and isinstance(m.get("content"), str)] + [user_input],
+        }
+        try:
+            response = self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "system", "content": QUESTION_REVIEW_PROMPT},
+                          {"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
+                tools=[QUESTION_REVIEW_TOOL],
+                tool_choice={"type": "function", "function": {"name": "propose_quote_changes"}},
+            )
+            calls = response.choices[0].message.tool_calls or []
+            if len(calls) != 1 or calls[0].function.name != "propose_quote_changes":
+                raise ValueError("問題複核未回傳唯一合法提案")
+            proposal = json.loads(calls[0].function.arguments)
+            _validate_proposal(proposal)
+            if set(proposal) != {"changes", "questions"} or proposal["changes"]:
+                raise ValueError("問題複核不得修改規格或數量")
+            if any(q not in questions for q in proposal["questions"]):
+                raise ValueError("問題複核只能保留原問題")
+            remaining = [q for q in questions if q in proposal["questions"] or q in protected]
+            draft["questions"] = remaining
+            log_action("quote_questions_review_finished", result={
+                "revision": draft.get("revision", 0),
+                "removed_questions": [q for q in questions if q not in remaining],
+                "remaining_questions": remaining, "source": "llm",
+            })
+            return True
+        except Exception as exc:
+            log_action("quote_questions_review_failed", result={
+                "error_type": type(exc).__name__, "error": str(exc), "questions": questions,
+            })
+            return False
+
     @staticmethod
     def _turn_context(draft: dict) -> dict:
         workgroup = draft.get("workgroup", WORKGROUP)
@@ -297,12 +446,23 @@ class LLMAgent:
                                     for o in options] for path, options in catalog["options"].items()},
             }
         selections = normalize_selections(draft.get("selections", {}))
+        def safe_options(options):
+            return [{k: o[k] for k in ("path", "code", "codsc", "display_path", "line_qty") if k in o}
+                    for o in options]
+        focused_path, focused_options = _current_candidates(draft)
         return {
             "current_draft": {"prodkind": draft.get("prodkind"), "qty": draft.get("qty"),
                               "discount_rate": draft.get("discount_rate", 0),
                               "revision": draft.get("revision", 0),
                               "selections": {path: {k: item.get(k) for k in ("path", "code", "codsc", "line_qty")}
-                                             for path, item in selections.items()}},
+                                              for path, item in selections.items()},
+                              "questions": draft.get("questions", []),
+                              "missing_fields": draft.get("missing_fields", []),
+                              "allowed_options": {p: safe_options(options) for p, options in
+                                                  (draft.get("allowed_options") or {}).items()},
+                              "pending_options": safe_options(draft.get("pending_options") or []),
+                              "focused_question": {"path": focused_path,
+                                                   "options": safe_options(focused_options)}},
             "categories": safe_categories, "catalogs": catalogs,
         }
 
@@ -314,9 +474,21 @@ class LLMAgent:
         # 不論工具格式錯誤、無工具、API 錯誤或變更被拒，舊預覽都不能再確認。
         invalidate_preview(quote_draft)
         try:
+            reviewer = lambda draft: self._review_questions(draft, messages, user_input)
             if shortcut is not None:
-                return _submit_proposal(quote_draft, shortcut)
+                return _submit_proposal(quote_draft, shortcut, review_questions=reviewer)
+            if user_input.strip() == "重新檢查" and quote_draft.get("questions"):
+                return _finish_turn(quote_draft, review_questions=reviewer)
+            unmatched = _unmatched_choice(user_input, quote_draft)
+            if unmatched is not None:
+                return unmatched
             context = self._turn_context(quote_draft)
+            log_action("quote_llm_context", params={
+                "revision": quote_draft.get("revision", 0),
+                "current_draft_fields": list(context["current_draft"]),
+                "allowed_group_count": len(quote_draft.get("allowed_options") or {}),
+                "selection_count": len(context["current_draft"]["selections"]),
+            })
             history = [{"role": m["role"], "content": m["content"]} for m in (messages or [])[-10:]
                        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
             # UI 可能已加入本回合輸入，不重複傳送。
@@ -332,11 +504,19 @@ class LLMAgent:
                 tool_choice={"type": "function", "function": {"name": "propose_quote_changes"}},
             )
             calls = response.choices[0].message.tool_calls or []
+            log_action("quote_llm_response", result={
+                "tool_call_count": len(calls),
+                "tool_names": [call.function.name for call in calls],
+            })
             if len(calls) != 1 or calls[0].function.name != "propose_quote_changes":
                 return _waiting(quote_draft, "尚未取得唯一且合法的需求提案，請補充欲修改的規格或數量。")
             proposal = json.loads(calls[0].function.arguments)
             return _submit_proposal(quote_draft, proposal)
         except Exception as exc:
+            log_action("quote_llm_turn_failed", result={
+                "revision": quote_draft.get("revision", 0),
+                "error_type": type(exc).__name__, "error": str(exc),
+            })
             return _waiting(quote_draft, f"無法套用需求，請修正或補充：{exc}")
 
     @staticmethod

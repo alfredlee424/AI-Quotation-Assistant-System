@@ -186,6 +186,7 @@ def check_missing_fields(quote_draft: dict) -> list[str]:
     if not quote_draft.get("prodkind"):
         missing.insert(0, "產品類別")
         quote_draft["allowed_options"] = {}
+        quote_draft["option_labels"] = {}
     else:
         # 主檔缺失或連線失敗必須傳遞，不可回退到固定 REQUIRED_OPTNOS。
         try:
@@ -196,6 +197,7 @@ def check_missing_fields(quote_draft: dict) -> list[str]:
         missing.extend(resolved["errors"])
         missing.extend(resolved["missing"])
         quote_draft["allowed_options"] = resolved["allowed_options"]
+        quote_draft["option_labels"] = resolved["option_labels"]
     quote_draft["missing_fields"] = missing
     if missing or quote_draft.get("questions") or quote_draft.get("pending_options"):
         invalidate_preview(quote_draft)

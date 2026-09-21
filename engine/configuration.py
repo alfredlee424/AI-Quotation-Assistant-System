@@ -7,6 +7,7 @@ import math
 
 from config import PRODUCT_PREFIX, WORKGROUP
 from database import repository as repo
+from utils.option_labels import path_label
 
 
 def number(value, label: str, *, positive: bool = False) -> float:
@@ -86,6 +87,7 @@ def resolve_configuration(draft: dict, catalog: dict | None = None) -> dict:
     prodkind = str(draft.get("prodkind") or PRODUCT_PREFIX)
     catalog = catalog or load_catalog(prodkind, draft.get("workgroup", WORKGROUP))
     nodes, options = catalog["nodes"], catalog["options"]
+    option_labels = {p: path_label(p, catalog["labels"]) for p in nodes}
     selected = normalize_selections(draft.get("selections", {}))
     errors, missing, allowed = [], [], {}
     for path, item in selected.items():
@@ -119,7 +121,7 @@ def resolve_configuration(draft: dict, catalog: dict | None = None) -> dict:
         if len(chosen) > 1:
             errors.append(f"材料方案互斥，請移除多餘分支：{parent}")
         elif parent in active and not chosen:
-            missing.append(f"請選擇材料方案：{parent}")
+            missing.append(f"請選擇材料方案：{option_labels[parent]}")
             allowed[parent] = []
             for child in children:
                 if options[child]:
@@ -151,11 +153,14 @@ def resolve_configuration(draft: dict, catalog: dict | None = None) -> dict:
         if target:
             selected[path] = _entry(path, target, catalog, automatic=True)
         else:
-            missing.append(f"請選擇規格：{path}")
+            missing.append(f"請選擇規格：{option_labels[path]}")
             allowed[path] = [dict(o, path=path) for o in candidates]
+    for candidates in allowed.values():
+        for candidate in candidates:
+            candidate["display_path"] = option_labels[candidate["path"]]
     return {"valid": not errors and not missing, "errors": errors, "missing": missing,
             "allowed_options": allowed, "selections": {p: selected[p] for p in nodes if p in selected},
-            "active_paths": active, "catalog": catalog}
+            "active_paths": active, "catalog": catalog, "option_labels": option_labels}
 
 
 def apply_proposal(draft: dict, proposal: dict) -> dict:
@@ -221,6 +226,7 @@ def apply_proposal(draft: dict, proposal: dict) -> dict:
     updated["selections"] = resolved["selections"]
     updated["missing_fields"] = resolved["missing"]
     updated["allowed_options"] = resolved["allowed_options"]
+    updated["option_labels"] = resolved["option_labels"]
     updated["revision"] = int(draft.get("revision", 0)) + 1
     invalidate_preview(updated)
     updated.pop("pending_options", None)

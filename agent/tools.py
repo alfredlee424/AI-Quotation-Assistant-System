@@ -161,13 +161,15 @@ def calculate_quote(quote_draft: dict) -> dict:
 def preview_quote(quote_draft: dict) -> dict:
     """只有本函式成功後才可進入 PREVIEW，預覽持有固定且完整的計算版本。"""
     from engine.preview import freeze_preview
+    from utils.option_labels import display_text, short_part
     preview = freeze_preview(quote_draft)
     calc = preview["calc"]
     lines = ["📋 固定版本報價預覽", f"版本：{preview['revision']} / {preview['preview_id'][:8]}",
              f"產品：{quote_draft.get('product_name', quote_draft.get('prodkind'))}，數量：{quote_draft['qty']}"]
     for selection in preview["selections"].values():
         if selection.get("code"):
-            lines.append(f"{selection['path']}：{selection['codsc']}（每件 {selection['line_qty']:g}）")
+            label = preview["option_labels"].get(selection["path"], "產品規格")
+            lines.append(f"{short_part(label)}：{display_text(selection['codsc'])}（每件 {selection['line_qty']:g}）")
     lines.extend([f"材料與工費成本：{calc['total_cost']:,.2f}",
                   f"加成後小計：{calc['subtotal']:,.2f}",
                   f"折扣：{calc['discount_amount']:,.2f}，稅額：{calc['tax_amount']:,.2f}",

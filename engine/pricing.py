@@ -4,6 +4,7 @@ from __future__ import annotations
 from config import WORKGROUP
 from database import repository as repo
 from engine.configuration import number, resolve_configuration
+from utils.logger import log_action
 
 
 # 明確按件計價的類別。立水、上／下板及貼面材料必須有 BOM 規則。
@@ -66,4 +67,13 @@ def calculate_configuration(draft: dict):
                              markup_rate=_quo_rate_to_markup(rate))
     for item in result.items:
         item.update(evidence[item["path"]])
+    log_action("quote_pricing_sources", params={
+        "revision": draft.get("revision", 0), "prodkind": draft.get("prodkind"),
+    }, result={
+        "total_cost": result.total_cost,
+        "items": [{key: item.get(key) for key in (
+            "path", "spc_code", "spdsc", "source", "driver_path", "driver_code",
+            "product_qty", "line_qty", "stdqty", "stdpar", "compri", "part_cost",
+        )} for item in result.items],
+    })
     return result, resolved

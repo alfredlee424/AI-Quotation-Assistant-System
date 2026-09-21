@@ -36,6 +36,7 @@ def freeze_preview(draft: dict) -> dict:
     draft["selections"] = deepcopy(resolved["selections"])
     draft["missing_fields"] = []
     draft["allowed_options"] = {}
+    draft["option_labels"] = deepcopy(resolved["option_labels"])
     preview_id = uuid4().hex
     preview = {
         "preview_id": preview_id, "revision": draft.get("revision", 0),
@@ -45,6 +46,7 @@ def freeze_preview(draft: dict) -> dict:
         "rounding": "ROUND_HALF_UP; totals rounded after summation",
         "identity": draft_identity(draft),
         "selections": deepcopy(resolved["selections"]),
+        "option_labels": deepcopy(resolved["option_labels"]),
         "calc": asdict(result),
         "source_ref_no": draft.get("imported_quote", {}).get("source_ref_no"),
     }

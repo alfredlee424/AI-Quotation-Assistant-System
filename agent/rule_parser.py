@@ -379,44 +379,74 @@ def parse_and_update(user_input: str, quote_draft: dict) -> tuple[dict, list[str
 
 def format_missing_prompt(missing_fields: list[str], current_draft: dict,
                           missing_options: Optional[dict[str, list[dict]]] = None) -> str:
-    lines = []
-    if current_draft.get("qty"):
-        lines.append(f"產品數量：{current_draft['qty']}")
-    if missing_fields:
-        lines.append("還缺少以下資訊：")
-        lines.extend(f"  • {field}" for field in missing_fields)
+    from utils.option_labels import menu_labels, short_part, open_question
+
     # 一次聚焦第一組，編號與 allowed option shortcut 的解讀一致。
     allowed = missing_options or {}
     if allowed:
         path, options = next(iter(allowed.items()))
-        lines.append(f"請先選擇：{path}")
+        label = current_draft.get("option_labels", {}).get(path, "目前部件的規格")
+        lines = [f"請選擇{short_part(label)}：", ""]
         if not options:
-            lines.append("資料庫目前沒有可供選擇的規格。")
-        for index, option in enumerate(options, 1):
-            lines.append(f"  {index}. {option.get('codsc', '')}（代碼：{option.get('code', '')}，"
-                         f"路徑：{option.get('path') or path}）")
-    lines.append("請補充完整規格，或以編號選擇上述第一組候選。")
-    return "\n".join(lines)
+            return lines[0] + "\n目前沒有可選規格，請確認產品設定。"
+        lines.extend(f"{index}. {name}" for index, name in enumerate(menu_labels(options), 1))
+        return "\n".join(lines) + "\n\n回覆編號或名稱即可。"
+    if missing_fields:
+        if missing_fields[0] == "數量":
+            return "請問需要幾件產品？"
+        return open_question(missing_fields[0], current_draft.get("option_labels", {}))
+    return "請補充產品規格。"
 
 
 def format_candidate_confirmation(candidates: list[dict], prompt: str = "") -> str:
-    lines = [prompt or "找到多個可能規格，請指定正確的部件路徑與規格："]
-    for index, candidate in enumerate(candidates, 1):
-        lines.append(f"  {index}. {candidate.get('codsc', '')}（代碼：{candidate.get('code', '')}，"
-                     f"路徑：{candidate.get('path', '')}）")
-    lines.append("請回覆編號，或提供更完整的部件與規格描述。")
-    return "\n".join(lines)
+    from utils.option_labels import menu_labels
+
+    lines = [prompt or "請選擇規格：", ""]
+    lines.extend(f"{index}. {name}" for index, name in enumerate(menu_labels(candidates), 1))
+    return "\n".join(lines) + "\n\n回覆編號或名稱即可。"
+
+
+def _choice_text(text: str) -> str:
+    from unicodedata import normalize
+    from utils.option_labels import display_text
+    return display_text(normalize("NFKC", text)).strip().casefold()
+
+
+def _candidate_aliases(candidate: dict) -> set[str]:
+    from utils.option_labels import candidate_label
+    name, code, path = (candidate.get(k, "") for k in ("codsc", "code", "path"))
+    return {_choice_text(value) for value in (
+        name, code, candidate_label(candidate), candidate_label(candidate, compact=True),
+        f"{path} {code}" if path else "",
+        f"{name}（代碼：{code}，路徑：{path}）" if path else "",
+    ) if value}
+
+
+def is_candidate_reply(text: str, candidates: list[dict]) -> bool:
+    """可辨識為選單回答但未命中時，保留候選而非交給模型猜選。"""
+    value = _choice_text(text)
+    return bool(candidates) and bool(
+        re.fullmatch(r"(?:第\s*)?\d+(?:\s*[個項號])?", value)
+        or re.fullmatch(r"\d+(?:\s*[.、)]\s*|\s+).+", value)
+        or ("代碼:" in value and "路徑:" in value)
+        or any(value in _candidate_aliases(c) for c in candidates)
+    )
 
 
 def select_candidate(text: str, candidates: list[dict]) -> Optional[dict]:
-    """整句編號或唯一精確代碼／名稱才算選擇，確認不等於第一筆。"""
-    value = text.strip().casefold()
+    """只選目前候選的唯一精確項；編號附名稱時兩者必須一致。"""
+    value = _choice_text(text)
     match = re.fullmatch(r"(?:第\s*)?(\d+)(?:\s*[個項號])?", value)
     if match:
         index = int(match[1]) - 1
         return deepcopy(candidates[index]) if 0 <= index < len(candidates) else None
-    matched = [c for c in candidates if value and value in (
-        str(c.get("code", "")).casefold(), str(c.get("codsc", "")).casefold(),
-        f"{c.get('path', '')} {c.get('code', '')}".casefold(),
-    )]
-    return deepcopy(matched[0]) if len(matched) == 1 else None
+    matched = [c for c in candidates if value and value in _candidate_aliases(c)]
+    if matched:
+        return deepcopy(matched[0]) if len(matched) == 1 else None
+    numbered = re.fullmatch(r"(\d+)(?:\s*[.、)]\s*|\s+)(.+)", value)
+    if numbered:
+        index = int(numbered[1]) - 1
+        if 0 <= index < len(candidates) and numbered[2] in _candidate_aliases(candidates[index]):
+            return deepcopy(candidates[index])
+        return None
+    return None

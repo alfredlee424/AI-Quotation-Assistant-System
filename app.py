@@ -338,6 +338,13 @@ with right_col:
 
     # ── 報價明細表格 ─────────────────────────────────────
     calc_result = quote_data.get("calc_result")
+    if not calc_result and sel_list:
+        st.markdown("**📋 已選草稿明細**")
+        st.caption("每次選擇即更新；規格齊全後才試算，人工確認後才建立正式報價。")
+        st.dataframe([
+            {"部件": sel["optdesc"], "規格": sel["codsc"], "每件產品用量": sel["line_qty"]}
+            for sel in sel_list
+        ], use_container_width=True, hide_index=True)
     if calc_result and calc_result.get("items"):
         st.markdown("**📊 報價明細**")
         df = calc_items_to_df(calc_result["items"])

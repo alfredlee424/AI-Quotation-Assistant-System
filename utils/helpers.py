@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 import pandas as pd
+from utils.option_labels import display_text
 
 
 # ============================================================
@@ -70,7 +71,7 @@ def calc_items_to_df(items: list[dict]) -> pd.DataFrame:
     for item in items:
         rows.append({
             "類別": item.get("optdesc") or item.get("part_desc", ""),
-            "規格": item.get("codsc") or item.get("spdsc", ""),
+            "規格": display_text(item.get("codsc") or item.get("spdsc", "")),
             "數量": fmt_qty(item.get("qty")),
             "標準用量": fmt_qty(item.get("stdqty")),
             "採購成本": fmt_money(item.get("compri")),
@@ -161,9 +162,11 @@ def quote_selections_list(quote_draft: dict) -> list[dict]:
     return [
         {
             "optno": optno,
-            "optdesc": sel.get("optdesc", optno),
-            "codsc": sel.get("codsc", "--"),
+            "optdesc": quote_draft.get("option_labels", {}).get(sel.get("path", optno))
+                       or sel.get("optdesc") or "未命名部件",
+            "codsc": display_text(sel.get("codsc") or "結構項目"),
             "compri": sel.get("compri", 0.0),
+            "line_qty": sel.get("line_qty", 1),
         }
         for optno, sel in selections.items()
     ]
