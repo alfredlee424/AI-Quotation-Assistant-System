@@ -65,13 +65,13 @@ def test_missing_fields_uses_real_ordstr_before_config(cmt1_db):
     assert draft["status"] == QuoteStatus.WAITING_FOR_INPUT
 
 
-def test_product_context_does_not_silently_choose_overlapping_categories(monkeypatch):
+def test_product_context_does_not_silently_choose_separately_mentioned_categories(monkeypatch):
     monkeypatch.setattr(core.repo, "get_product_categories", lambda **kw: [
         {"prodkind": "CMT1", "codsc": "環式會議桌", "quo_rate": 1.3},
         {"prodkind": "MT", "codsc": "會議桌", "quo_rate": 1.2},
     ])
     draft = new_quote_draft()
-    assert core.LLMAgent._prepare_product_context("環式會議桌", draft)
+    assert core.LLMAgent._prepare_product_context("環式會議桌和會議桌", draft)
     assert not draft.get("prodkind")
     assert core.LLMAgent._prepare_product_context("CMT1", draft) is None
     assert draft["prodkind"] == "CMT1"

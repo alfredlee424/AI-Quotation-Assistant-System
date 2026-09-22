@@ -293,6 +293,31 @@ def _submit_proposal(draft: dict, proposal: dict,
     return message, draft
 
 
+def _match_product_categories(user_input: str, categories: list[dict]) -> tuple[list[dict], list[dict]]:
+    """排除僅內嵌於較長名稱的命中；獨立提及、同名及明示代碼仍保留。"""
+    text = user_input.strip().casefold()
+    code_matches = set()
+    name_spans = []
+    for index, category in enumerate(categories):
+        code = str(category.get("prodkind") or "").strip().casefold()
+        if code and re.search(r"(?<![a-z0-9])" + re.escape(code) + r"(?![a-z0-9])", text):
+            code_matches.add(index)
+        name = str(category.get("codsc") or "").strip().casefold()
+        if name:
+            # Lookahead 保留所有出現位置（包含相互重疊的名稱），不能只比對第一次。
+            name_spans.extend((index, match.start(), match.start() + len(name))
+                              for match in re.finditer(r"(?=" + re.escape(name) + r")", text))
+    raw_matches = code_matches | {index for index, _, _ in name_spans}
+    matches = code_matches.copy()
+    for index, start, end in name_spans:
+        if not any(other_start <= start and end <= other_end and other_end - other_start > end - start
+                   for _, other_start, other_end in name_spans):
+            matches.add(index)
+    # 相同完整名稱的不同類別不互相遮蔽；短名稱若另有獨立提及也不能被移除。
+    return ([category for index, category in enumerate(categories) if index in matches],
+            [category for index, category in enumerate(categories) if index in raw_matches - matches])
+
+
 def _product_prompt(categories: list[dict]) -> str:
     names = "、".join(c.get("codsc") or "未命名產品" for c in categories)
     return "請先選擇報價產品類別：" + (names or "目前沒有可報價的產品類別，請確認產品主檔。")
@@ -527,12 +552,7 @@ class LLMAgent:
     def _prepare_product_context(user_input: str, quote_draft: dict) -> Optional[str]:
         """保留規則模式 API；絕不以固定產品或第一筆作為預設。"""
         categories = repo.get_product_categories(workgroup=quote_draft.get("workgroup", WORKGROUP))
-        text = user_input.strip().casefold()
-        matched = [c for c in categories if (
-            str(c.get("prodkind", "")).strip() and
-            re.search(r"(?<![a-z0-9])" + re.escape(str(c["prodkind"]).casefold()) + r"(?![a-z0-9])", text)
-        ) or (str(c.get("codsc") or "").strip() and str(c["codsc"]).strip().casefold() in text)]
-        # 僅記錄既有決策，不改變名稱比對或歧義選擇規則。
+        matched, suppressed = _match_product_categories(user_input, categories)
         if not matched and quote_draft.get("prodkind"):
             outcome = "keep_existing_product"
         elif not categories:
@@ -549,8 +569,12 @@ class LLMAgent:
             "current_prodkind": quote_draft.get("prodkind"),
         }, result={
             "category_count": len(categories), "matched_count": len(matched),
+            "raw_matched_count": len(matched) + len(suppressed),
             "matched_categories": [{"prodkind": c.get("prodkind"), "codsc": c.get("codsc")}
                                    for c in matched[:50]],
+            "suppressed_categories": [{"prodkind": c.get("prodkind"), "codsc": c.get("codsc")}
+                                      for c in suppressed[:50]],
+            "suppressed_truncated": len(suppressed) > 50,
             "matches_truncated": len(matched) > 50,
             "outcome": outcome,
         })
