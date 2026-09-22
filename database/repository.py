@@ -38,6 +38,7 @@ from sqlalchemy import or_
 from database.connection import get_db
 from database.models import Ordspd, Ordspe, Ordqty, Invdoc, Ordstr, ordqdt_ai
 from config import WORKGROUP, PRODUCT_PREFIX, ORDKIND_PRODUCT
+from utils.logger import log_action
 
 
 # ============================================================
@@ -578,7 +579,7 @@ def get_product_categories(
             .order_by(Invdoc.prodkind)
             .all()
         )
-        return [
+        categories = [
             {
                 "prodkind": (r.prodkind or "").strip(),
                 "codsc": (r.codsc or "").strip() if r.codsc else None,
@@ -587,6 +588,22 @@ def get_product_categories(
             }
             for r in rows
         ]
+        # 不額外查詢、不記錄連線字串／帳密／報價率；名稱保留內部字元供診斷。
+        log_action("quote_product_categories_loaded", params={
+            "workgroup": workgroup, "ordkind": ordkind,
+            "backend": db.get_bind().dialect.name,
+        }, result={
+            "category_count": len(categories),
+            "categories": [{"prodkind": c["prodkind"], "codsc": c["codsc"]}
+                           for c in categories[:50]],
+            "categories_truncated": len(categories) > 50,
+        })
+        return categories
+    except Exception as exc:
+        log_action("quote_product_categories_failed", params={
+            "workgroup": workgroup, "ordkind": ordkind,
+        }, result={"error_type": type(exc).__name__})
+        raise
     finally:
         db.close()
 

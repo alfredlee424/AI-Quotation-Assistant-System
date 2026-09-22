@@ -350,6 +350,10 @@ class RuleBasedAgent:
                 quote_draft["pending_options"] = candidates
             return _finish_turn(quote_draft)
         except Exception as exc:
+            log_action("quote_rule_turn_failed", result={
+                "revision": quote_draft.get("revision", 0),
+                "error_type": type(exc).__name__,
+            })
             return _waiting(quote_draft, f"無法套用需求，請修正或補充：{exc}")
 
 
@@ -528,6 +532,28 @@ class LLMAgent:
             str(c.get("prodkind", "")).strip() and
             re.search(r"(?<![a-z0-9])" + re.escape(str(c["prodkind"]).casefold()) + r"(?![a-z0-9])", text)
         ) or (str(c.get("codsc") or "").strip() and str(c["codsc"]).strip().casefold() in text)]
+        # 僅記錄既有決策，不改變名稱比對或歧義選擇規則。
+        if not matched and quote_draft.get("prodkind"):
+            outcome = "keep_existing_product"
+        elif not categories:
+            outcome = "no_categories"
+        elif not matched:
+            outcome = "no_match"
+        elif len(matched) > 1:
+            outcome = "ambiguous"
+        else:
+            outcome = "selected"
+        log_action("quote_product_match", params={
+            "workgroup": quote_draft.get("workgroup", WORKGROUP),
+            "input_length": len(user_input),
+            "current_prodkind": quote_draft.get("prodkind"),
+        }, result={
+            "category_count": len(categories), "matched_count": len(matched),
+            "matched_categories": [{"prodkind": c.get("prodkind"), "codsc": c.get("codsc")}
+                                   for c in matched[:50]],
+            "matches_truncated": len(matched) > 50,
+            "outcome": outcome,
+        })
         if not matched and quote_draft.get("prodkind"):
             return None
         if len(matched) != 1:
@@ -559,6 +585,10 @@ def run_quote_agent(user_input: str, quote_draft: Optional[dict],
     if control is not None:
         return control
     try:
+        log_action("quote_agent_route", params={
+            "workgroup": quote_draft.get("workgroup", WORKGROUP),
+            "revision": quote_draft.get("revision", 0),
+        }, result={"mode": "llm" if USE_LLM else "rule"})
         agent = LLMAgent() if USE_LLM else RuleBasedAgent()
         return agent.run(user_input, quote_draft, messages or [])
     except Exception as exc:
