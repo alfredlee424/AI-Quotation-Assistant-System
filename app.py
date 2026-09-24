@@ -28,6 +28,8 @@ from utils.helpers import (
     fmt_money,
 )
 from utils.logger import log_action, log_error, log_quote_created, log_user_input
+from utils.work_order_ui import render_work_order_review
+from utils.multi_quote_ui import render_multi_quote_workspace
 from config import USE_LLM, OPENAI_MODEL, IS_SQLITE, print_config
 
 
@@ -52,9 +54,6 @@ def _init_app():
     """初始化資料庫（建立資料表 + 灌入範例資料）"""
     seed()
     return True
-
-
-_init_app()
 
 
 # ============================================================
@@ -156,6 +155,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.divider()
+
+workspace = st.radio("工作區", ["單品報價", "生產工單核對", "多明細配置草稿"], horizontal=True, key="workspace")
+if workspace == "生產工單核對":
+    render_work_order_review(st)
+    st.stop()  # 獨立核對入口不初始化主檔，也不顯示既有單品的確認區塊。
+
+if workspace == "多明細配置草稿":
+    render_multi_quote_workspace(st)
+    st.stop()  # 只允許明確操作的主檔讀取，不計價、灌入資料或保存正式報價。
+
+_init_app()
 
 
 # ============================================================
