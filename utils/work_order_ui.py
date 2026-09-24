@@ -32,6 +32,8 @@ def render_work_order_review(st) -> None:
         return
     st.caption(f"版本 {batch.revision}｜{len(batch.orders)} 張工單候選｜"
                f"{sum(len(order.items) for order in batch.orders)} 筆明細候選；筆數不是成品桌總數。")
+    from utils.work_order_diagnostics_ui import render_work_order_diagnostics
+    render_work_order_diagnostics(st, batch)
     by_id = {line.line_id: line for line in batch.lines}
     with st.expander("完整來源與行分類", expanded=not batch.orders):
         st.dataframe([{"行號": line.number, "原文": line.raw, "分類": KIND_LABELS[line.kind],
