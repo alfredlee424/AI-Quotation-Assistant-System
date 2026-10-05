@@ -13,6 +13,8 @@ from uuid import UUID, uuid4, uuid5
 from agent.state import new_quote_draft
 from agent.work_orders import WorkOrderBatch
 from agent.requirement_review import RequirementRecord, ReviewEvidence, initialize_requirements, refresh_review_evidence
+from agent.conditions import ConditionRecord, validate_condition_configuration
+from agent.drawing_review import DrawingDependency
 from config import MAX_DISCOUNT_RATE, WORKGROUP
 from engine.configuration import apply_proposal, normalize_selections, number
 
@@ -66,6 +68,8 @@ class MultiQuoteDraft:
     questions: tuple[ScopedQuestion, ...] = ()
     requirements: tuple[RequirementRecord, ...] = ()
     archived_requirements: tuple[RequirementRecord, ...] = ()
+    conditions: tuple[ConditionRecord, ...] = ()
+    drawings: tuple[DrawingDependency, ...] = ()
 
 
 _GATE = "多明細整單計價與正式快照尚未接通，不可建立正式報價。"
@@ -190,6 +194,7 @@ def apply_multi_command(draft: MultiQuoteDraft, command: dict, *, draft_id: str,
     fields = {
         "add": {"op", "label"}, "remove": {"op", "line_id"}, "restore": {"op", "line_id"},
         "reorder": {"op", "line_ids"}, "configure": {"op", "line_id", "proposal"},
+        "set_discount": {"op", "discount_rate"},
     }
     operation = command["op"]
     if operation not in fields or set(command) != fields[operation]:
@@ -218,6 +223,13 @@ def apply_multi_command(draft: MultiQuoteDraft, command: dict, *, draft_id: str,
         by_id = {line.line_id: line for line in lines}
         lines = [by_id[key] for key in ids]
         affected = tuple(ids)
+    elif operation == "set_discount":
+        rate = number(command["discount_rate"], "整單折扣率")
+        if rate > min(MAX_DISCOUNT_RATE, 1):
+            raise ValueError("整單折扣超過目前允許範圍。")
+        if rate == draft.discount_rate:
+            raise ValueError("整單折扣未改變。")
+        updated = replace(updated, discount_rate=rate)
     else:
         pool = archived if operation == "restore" else lines
         line = next((line for line in pool if line.line_id == command["line_id"]), None)
@@ -244,7 +256,8 @@ def apply_multi_command(draft: MultiQuoteDraft, command: dict, *, draft_id: str,
             config = deepcopy(line.configuration)
             if config.get("workgroup") != draft.workgroup:
                 raise ValueError("明細事業別與整單不一致。")
-            apply_proposal(config, validated)
+            resolved = apply_proposal(config, validated)
+            validate_condition_configuration(updated, line.line_id, config, resolved["active_paths"])
             config.update(status="WAITING_FOR_INPUT", preview=None, calc_result=None, ref_no=None)
             changed_line = replace(line, configuration=config, revision=line.revision + 1)
             lines[lines.index(line)] = changed_line

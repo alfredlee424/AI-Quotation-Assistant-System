@@ -1,4 +1,4 @@
-"""測試程序隔離：匯入 production 之前設定環境，所有 DB 只存在記憶體。
+"""測試程序隔離：正式連線替換為記憶體 DB；配號併發另用 tmp_path SQLite。
 
 不注入假 database 模組，不讀寫開發 DB，不允許 SDK 發出網路請求。
 """
@@ -10,6 +10,10 @@ import socket
 from tempfile import TemporaryDirectory
 
 import pytest
+import dotenv
+
+# 在 production config 匯入前停用 dotenv；包含舊版套件也不得讀取私密環境檔。
+dotenv.load_dotenv = lambda *args, **kwargs: False
 
 
 _process_tmp = TemporaryDirectory(prefix="quote-tests-")

@@ -11,11 +11,15 @@ def _store(st, draft):
     drafts = dict(st.session_state.get("multi_quote_drafts", {}))
     drafts[draft.draft_id] = draft
     st.session_state["multi_quote_drafts"] = drafts
+    from utils.quote_batch_ui import clear_quote_batch
+    clear_quote_batch(st, draft.draft_id)
+    from utils.quote_batch_trial_ui import clear_batch_trial
+    clear_batch_trial(st, draft.draft_id)
 
 
 def render_multi_quote_workspace(st) -> None:
-    st.subheader("多明細配置草稿（不計價）")
-    st.warning("各明細可分別選配，但尚未檢查整單需求覆蓋、成本及圖面；本區不能建立正式報價。")
+    st.subheader("多明細配置草稿（可內部試算，非正式報價）")
+    st.warning("各明細可分別選配及另行內部試算；整單需求覆蓋、圖面與工程核准尚未完成，本區不能建立正式報價。")
     st.caption("草稿只存於工作階段，下載可保留紀錄但尚不支援重新匯入。轉接會新增草稿，不取代單品或工單來源。")
 
     def create(factory):
@@ -61,6 +65,10 @@ def render_multi_quote_workspace(st) -> None:
     try:
         check_source_current(draft, batch)
     except ValueError as exc:
+        from utils.quote_batch_ui import clear_quote_batch
+        clear_quote_batch(st, draft.draft_id)
+        from utils.quote_batch_trial_ui import clear_batch_trial
+        clear_batch_trial(st, draft.draft_id)
         st.error(str(exc))
         return
 
@@ -72,11 +80,54 @@ def render_multi_quote_workspace(st) -> None:
     actor = st.text_input("操作人（自填紀錄，非核准簽章）", key=f"multi_actor_{selected}", max_chars=80)
     reason = st.text_input("本次操作理由", key=f"multi_reason_{selected}", max_chars=1000)
 
+    with st.expander("批次逐張展開核對與下載（非正式、無金額）", expanded=False):
+        from utils.quote_batch_ui import render_quote_batch
+        render_quote_batch(st, draft, batch, actor)
+
+    with st.expander("批次逐張獨立金額試算（非正式、不配號）", expanded=False):
+        from utils.quote_batch_trial_ui import render_batch_trial
+        batch_updated = render_batch_trial(st, draft, batch, actor)
+        if batch_updated is not None:
+            _store(st, batch_updated)
+            st.rerun()
+
+    with st.expander("整批固定內容與兩次核對（非正式、非開立）", expanded=False):
+        from utils.quote_batch_review_ui import render_batch_review
+        render_batch_review(st, draft, batch, actor)
+
+    with st.expander("工單數值候選核對與受控套用", expanded=False):
+        from utils.numeric_application_ui import render_numeric_application
+        numeric_updated = render_numeric_application(st, draft, batch, actor)
+        if numeric_updated is not None:
+            _store(st, numeric_updated)
+            st.rerun()
+
     with st.expander("逐句需求對照與有依據的人工核對", expanded=False):
         from utils.requirement_review_ui import render_requirement_review
         reviewed = render_requirement_review(st, draft, batch, actor)
         if reviewed is not None:
             _store(st, reviewed)
+            st.rerun()
+
+    with st.expander("共用條件、局部例外與否定核對", expanded=False):
+        from utils.condition_ui import render_conditions
+        conditioned = render_conditions(st, draft, batch, actor)
+        if conditioned is not None:
+            _store(st, conditioned)
+            st.rerun()
+
+    with st.expander("圖面依賴與版本核對（非工程核准）", expanded=False):
+        from utils.drawing_review_ui import render_drawing_review
+        drawing_updated = render_drawing_review(st, draft, batch, actor)
+        if drawing_updated is not None:
+            _store(st, drawing_updated)
+            st.rerun()
+
+    with st.expander("多明細內部試算與整單折扣（不可正式確認）", expanded=False):
+        from utils.multi_trial_ui import render_multi_trial
+        trial_updated = render_multi_trial(st, draft, batch, actor)
+        if trial_updated is not None:
+            _store(st, trial_updated)
             st.rerun()
 
     if draft.questions:

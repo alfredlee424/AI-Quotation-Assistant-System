@@ -182,7 +182,9 @@ def refresh_review_evidence(draft: MultiQuoteDraft, previous: MultiQuoteDraft | 
                 line = replace(line, configuration=config, revision=max(line.revision, old[line.line_id].revision + 1))
             revised.append(line)
         result = replace(result, lines=tuple(revised))
-    return result
+    from agent.conditions import refresh_conditions
+    from agent.drawing_review import refresh_drawings
+    return refresh_drawings(refresh_conditions(result))
 
 
 def apply_review_command(draft: MultiQuoteDraft, command: dict, *, draft_id: str, expected_revision: int,

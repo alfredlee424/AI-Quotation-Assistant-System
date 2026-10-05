@@ -156,14 +156,19 @@ st.markdown(
 )
 st.divider()
 
-workspace = st.radio("工作區", ["單品報價", "生產工單核對", "多明細配置草稿"], horizontal=True, key="workspace")
+workspace = st.radio("工作區", ["單品報價", "生產工單核對", "多明細配置草稿", "產品線主檔盤點"], horizontal=True, key="workspace")
 if workspace == "生產工單核對":
     render_work_order_review(st)
     st.stop()  # 獨立核對入口不初始化主檔，也不顯示既有單品的確認區塊。
 
 if workspace == "多明細配置草稿":
     render_multi_quote_workspace(st)
-    st.stop()  # 只允許明確操作的主檔讀取，不計價、灌入資料或保存正式報價。
+    st.stop()  # 僅允許明確操作的唯讀查詢／內部試算，不灌入資料或保存正式報價。
+
+if workspace == "產品線主檔盤點":
+    from utils.master_inventory_ui import render_master_inventory
+    render_master_inventory(st)
+    st.stop()  # 唯讀盤點不得執行初始化、灌入或報價保存。
 
 _init_app()
 

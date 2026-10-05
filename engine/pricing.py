@@ -15,7 +15,7 @@ PER_ITEM_OPTIONS = {"S010", "S015", "S020", "S022", "S025", "S030", "S035",
 
 
 def calculate_configuration(draft: dict):
-    from engine.calculator import QuoteItem, calculate_quote, _quo_rate_to_markup
+    from engine.calculator import calculate_quote, _quo_rate_to_markup
 
     quantity = number(draft.get("qty"), "產品數量", positive=True)
     resolved = resolve_configuration(draft)
@@ -23,6 +23,30 @@ def calculate_configuration(draft: dict):
         raise ValueError("；".join(resolved["errors"] + resolved["missing"]))
     if draft.get("questions") or draft.get("pending_options"):
         raise ValueError("尚有未確認的需求或候選規格")
+    items, evidence, rate = _configuration_cost_inputs(draft, resolved)
+    result = calculate_quote(items, discount_rate=draft.get("discount_rate", 0),
+                             markup_rate=_quo_rate_to_markup(rate))
+    for item in result.items:
+        item.update(evidence[item["path"]])
+    log_action("quote_pricing_sources", params={
+        "revision": draft.get("revision", 0), "prodkind": draft.get("prodkind"),
+    }, result={
+        "total_cost": result.total_cost,
+        "items": [{key: item.get(key) for key in (
+            "path", "spc_code", "spdsc", "source", "driver_path", "driver_code",
+            "product_qty", "line_qty", "stdqty", "stdpar", "compri", "part_cost",
+        )} for item in result.items],
+    })
+    return result, resolved
+
+
+def _configuration_cost_inputs(draft: dict, resolved: dict):
+    """共用已驗證配置的成本輸入；不產生預覽、不解決問題或核准需求。"""
+    from engine.calculator import QuoteItem
+
+    if not resolved["valid"]:
+        raise ValueError("；".join(resolved["errors"] + resolved["missing"]))
+    quantity = number(draft.get("qty"), "產品數量", positive=True)
     wg = draft.get("workgroup", WORKGROUP)
     category = repo.get_product_category(draft["prodkind"], workgroup=wg)
     if not category or category.get("quo_rate") is None:
@@ -63,17 +87,4 @@ def calculate_configuration(draft: dict):
             stdqty=numerator, stdpar=denominator, compri=cost,
             optno=selection["optno"], optdesc=selection["optdesc"],
         ))
-    result = calculate_quote(items, discount_rate=draft.get("discount_rate", 0),
-                             markup_rate=_quo_rate_to_markup(rate))
-    for item in result.items:
-        item.update(evidence[item["path"]])
-    log_action("quote_pricing_sources", params={
-        "revision": draft.get("revision", 0), "prodkind": draft.get("prodkind"),
-    }, result={
-        "total_cost": result.total_cost,
-        "items": [{key: item.get(key) for key in (
-            "path", "spc_code", "spdsc", "source", "driver_path", "driver_code",
-            "product_qty", "line_qty", "stdqty", "stdpar", "compri", "part_cost",
-        )} for item in result.items],
-    })
-    return result, resolved
+    return items, evidence, rate

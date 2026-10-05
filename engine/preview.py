@@ -29,6 +29,8 @@ def draft_identity(draft: dict) -> dict:
 
 
 def freeze_preview(draft: dict) -> dict:
+    if draft.get("document_type") is not None or "document_version" in draft:
+        raise ValueError("既有單品預覽不接受批次或非正式文件。")
     if draft.get("ref_no") or draft.get("status") in ("SNAPSHOT_CREATED", "CREATING", "COMPLETED"):
         raise ValueError("已建立報價不能重新試算，請建立新草稿")
     invalidate_preview(draft)
@@ -59,6 +61,9 @@ def freeze_preview(draft: dict) -> dict:
 
 def checked_preview(draft: dict, preview_id: str) -> dict:
     preview = draft.get("preview")
+    if (draft.get("document_type") is not None or "document_version" in draft or
+            (isinstance(preview, dict) and (preview.get("document_type") is not None or "document_version" in preview))):
+        raise ValueError("既有單品確認不接受批次或非正式文件。")
     if not preview or not preview_id or preview.get("preview_id") != preview_id:
         raise ValueError("預覽版本不存在或已失效，請重新試算並確認")
     if draft.get("status") not in ("PREVIEW", "SNAPSHOT_CREATED"):

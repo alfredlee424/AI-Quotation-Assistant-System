@@ -421,6 +421,14 @@ def save_quote_snapshot(
     """
     if not items:
         raise ValueError("items 不能為空")
+    if isinstance(items, dict) or (isinstance(preview, dict) and (
+        preview.get("document_type") is not None or "document_version" in preview
+    )) or any(
+        isinstance(item, dict) and any(key in item for key in (
+            "line_id", "snapshot_values", "document_type", "document_version", "quote_batch_id", "child_quote_id"
+        )) for item in items
+    ):
+        raise ValueError("既有單品保存入口不接受多明細、內部試算或關聯演練文件。")
 
     ref_no = items[0]["ref_no"]
     db = _session()

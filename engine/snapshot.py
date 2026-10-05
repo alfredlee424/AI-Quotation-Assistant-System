@@ -85,6 +85,10 @@ def build_snapshot_items(
     Returns:
         list[dict]   可傳入 repository.save_quote_snapshot() 的資料
     """
+    if quote_draft.get("document_type") is not None or "document_version" in quote_draft or (
+        isinstance(calc_result, dict) and (calc_result.get("document_type") is not None or "document_version" in calc_result)
+    ):
+        raise ValueError("既有單品快照組裝不接受保留、批次或非正式文件。")
     today = datetime.date.today().strftime("%Y-%m-%d")
     selections: dict = quote_draft.get("selections", {})
 
@@ -186,6 +190,8 @@ def create_quote_snapshot(
     """
     if preview is None:
         raise ValueError("建立報價必須提供已確認的固定版本預覽")
+    if preview.get("document_type") is not None or "document_version" in preview:
+        raise ValueError("既有單品保存不接受保留、批次或非正式文件。")
     ref_no = preview["ref_no"]
     items = build_snapshot_items(
         calc_result=calc_result,
