@@ -193,7 +193,8 @@ class QuoteNumberReservationService:
             raise ReservationConflict("保留時間與前綴不一致")
         return _result(row, stored)
 
-    def _header_row(self, request, payload, prefix, reserved_at):
+    @staticmethod
+    def _header_row(request, payload, prefix, reserved_at):
         return dict(batch_id=request.batch_id, workgroup=request.workgroup,
                     request_id=request.request_id, preview_identity=request.preview_identity,
                     prefix=prefix, reserved_at=reserved_at, schema_version=SCHEMA_VERSION,

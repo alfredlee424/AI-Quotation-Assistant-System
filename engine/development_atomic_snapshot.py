@@ -133,7 +133,8 @@ class DevelopmentAtomicSnapshotService:
             raise ValueError("最終開發文件超過 128 MiB；拒絕、不截斷")
         return result
 
-    def _rows(self, request, document):
+    @staticmethod
+    def _rows(request, document):
         prefix = document["reservation"]["reservation"]["prefix"]
         header = {**asdict(identity_of(request)), "prefix": prefix, "state": "DEVELOPMENT_ONLY",
                   "created_at": document["created_at"], "child_count": len(request.children),
