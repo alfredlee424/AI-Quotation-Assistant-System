@@ -137,6 +137,8 @@ def calculate_quote(
     discount_rate: float = 0.0,
     markup_rate: Optional[float] = None,
     tax_rate: Optional[float] = None,
+    *,
+    evidence_sink=None,
 ) -> CalcResult:
     """
     依 QuoteItem 清單計算完整報價。
@@ -146,6 +148,7 @@ def calculate_quote(
         discount_rate : 折扣率（0.0 ~ MAX_DISCOUNT_RATE）
         markup_rate   : 加成率（預設使用 config.MARKUP_RATE）
         tax_rate      : 稅率（預設使用 config.TAX_RATE）
+        evidence_sink : 可選接收器，取得本次未捨入金額副本；不另算公式
 
     Returns:
         CalcResult 完整計算結果
@@ -195,6 +198,11 @@ def calculate_quote(
     after_discount = subtotal - discount_amount
     tax_amount = after_discount * _tax
     total_price = after_discount + tax_amount
+
+    if evidence_sink is not None:
+        evidence_sink(dict(total_cost=total_cost, subtotal=subtotal,
+                           discount_amount=discount_amount, after_discount=after_discount,
+                           tax_amount=tax_amount, total_price=total_price))
 
     return CalcResult(
         items=result_items,

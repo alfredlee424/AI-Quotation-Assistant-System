@@ -40,15 +40,16 @@ def calculate_configuration(draft: dict):
     return result, resolved
 
 
-def _configuration_cost_inputs(draft: dict, resolved: dict):
+def _configuration_cost_inputs(draft: dict, resolved: dict, *, repository=None):
     """共用已驗證配置的成本輸入；不產生預覽、不解決問題或核准需求。"""
     from engine.calculator import QuoteItem
 
+    repository = repo if repository is None else repository
     if not resolved["valid"]:
         raise ValueError("；".join(resolved["errors"] + resolved["missing"]))
     quantity = number(draft.get("qty"), "產品數量", positive=True)
     wg = draft.get("workgroup", WORKGROUP)
-    category = repo.get_product_category(draft["prodkind"], workgroup=wg)
+    category = repository.get_product_category(draft["prodkind"], workgroup=wg)
     if not category or category.get("quo_rate") is None:
         raise ValueError("產品未設定有效報價係數")
     rate = number(category["quo_rate"], "報價係數", positive=True)
@@ -62,7 +63,7 @@ def _configuration_cost_inputs(draft: dict, resolved: dict):
         numerator, denominator = 1.0, 1.0
         source, driver_path, driver_code = "zero_cost", "", ""
         if cost > 0:
-            rules = repo.get_quantity_rules(path, workgroup=wg)
+            rules = repository.get_quantity_rules(path, workgroup=wg)
             if rules:
                 drivers = {r.get("part_path") for r in rules}
                 if len(drivers) != 1 or not next(iter(drivers)):

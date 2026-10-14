@@ -80,6 +80,10 @@ def render_multi_quote_workspace(st) -> None:
     actor = st.text_input("操作人（自填紀錄，非核准簽章）", key=f"multi_actor_{selected}", max_chars=80)
     reason = st.text_input("本次操作理由", key=f"multi_reason_{selected}", max_chars=1000)
 
+    with st.expander("工單核對去識別化摘要（非正式）", expanded=False):
+        from utils.work_order_review_summary_ui import render_work_order_review_summary
+        render_work_order_review_summary(st, draft, batch, actor)
+
     with st.expander("批次逐張展開核對與下載（非正式、無金額）", expanded=False):
         from utils.quote_batch_ui import render_quote_batch
         render_quote_batch(st, draft, batch, actor)

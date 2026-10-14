@@ -89,9 +89,11 @@ def _check_seal(document):
         raise ValueError("試算內容被修改或程序已重啟，請重新試算；不接受下載檔重新匯入。")
 
 
-def _calculation(config, resolved, line_id, child_id, discount, tax):
-    items, evidence, rate = _configuration_cost_inputs(config, resolved)
-    result = calculate_quote(items, discount_rate=discount, markup_rate=rate - 1, tax_rate=tax)
+def _calculation(config, resolved, line_id, child_id, discount, tax, *, repository=None, evidence_sink=None):
+    inputs = {} if repository is None else {"repository": repository}
+    items, evidence, rate = _configuration_cost_inputs(config, resolved, **inputs)
+    evidence_options = {} if evidence_sink is None else {"evidence_sink": evidence_sink}
+    result = calculate_quote(items, discount_rate=discount, markup_rate=rate - 1, tax_rate=tax, **evidence_options)
     calc = asdict(result)
     for key in MONEY_FIELDS:
         calc[key] = _money_string(calc[key])
