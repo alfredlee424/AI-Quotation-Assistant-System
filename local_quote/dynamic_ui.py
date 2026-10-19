@@ -9,9 +9,11 @@ from pathlib import Path
 import streamlit as st
 
 from local_quote.dynamic_presentation import (hierarchy_rows, legacy_report_rows,
-                                              report_rows, safe_cell, screen_rows, tsv)
+                                              report_rows, safe_cell, screen_rows,
+                                              semantic_rows, semantic_text, tsv)
 from local_quote.dynamic_storage import DynamicStore, validate_actor
 from local_quote.dynamic_workflow import DynamicWorkspace
+from local_quote.catalog import option_identity
 from local_quote.storage import BatchStore, StorageError
 
 
@@ -22,7 +24,7 @@ def services():
     from local_quote.business import MasterSource
     db = LocalDatabase(load_settings(Path(__file__).resolve().parents[1] / ".env"))
     db.inspect_schema()
-    return MasterSource(db), DynamicStore(db), BatchStore(db)
+    return MasterSource(db, allow_code_variants=True), DynamicStore(db), BatchStore(db)
 
 
 def audit():
@@ -42,7 +44,10 @@ def editable_audit():
 
 
 def _mapping(ws, cid, name):
-    return deepcopy(ws.analysis["context"]["inputs"][name].get(cid, {}))
+    analysis = ws.analysis
+    if analysis is None or not any(c["id"] == cid for c in analysis["children"]):
+        raise ValueError("分析已失效，請重新分析目前工單")
+    return deepcopy(analysis["context"]["inputs"][name].get(cid, {}))
 
 
 def _edit(ws, cid, stamp, **changes):
@@ -54,9 +59,21 @@ def _edit(ws, cid, stamp, **changes):
     st.session_state["dq_notice"] = "本張已重新分析；如有舊固定預覽已撤銷，其他張不受影響。"
 
 
-def _callback(action, ws, cid, *args):
+def _callback(action, ws, cid, *args, origin=None):
+    # Streamlit 在 main() 同步來源前執行回呼，也可能送達已移除元件的舊事件。
+    # 不以空 mapping 補救：那會將舊候選／成本寫入另一份草稿。
+    current = st.session_state.get("dq_workspace")
+    analysis = current.analysis if current is not None else None
+    if (current is not ws or analysis is None
+            or st.session_state.get("dq_source") != current.source["text"]
+            or st.session_state.get("dq_category") != current.category
+            or origin != (analysis["source_digest"], analysis["catalog_digest"])
+            or not any(c["id"] == cid for c in analysis["children"])
+            or cid in current.saved):
+        st.session_state["dq_notice"] = "舊畫面的輸入事件已失效，未套用；請以目前工單的分析結果繼續操作。"
+        return
     try:
-        action(ws, cid, *args)
+        action(current, cid, *args)
     except (ValueError, StorageError) as exc:
         # 即使事件因稽核無效被拒絕，也不能保存畫面尚未套用的舊固定內容。
         st.session_state.setdefault("dq_blocked", {})[cid] = str(exc)
@@ -65,11 +82,11 @@ def _callback(action, ws, cid, *args):
 def _choose(ws, cid, requirement, widget, options):
     stamp = audit()
     index = st.session_state[widget]
-    if index is None:
+    if type(index) is not int or not 0 <= index < len(options):
         raise ValueError("請明確選擇合法候選；不提供清除必選規格捷徑")
     candidate = options[index]
     choices, customs = _mapping(ws, cid, "choices"), _mapping(ws, cid, "customs")
-    choices[requirement] = {key: candidate[key] for key in ("path", "code")}
+    choices[requirement] = option_identity(ws.catalog, candidate)
     customs.pop(requirement, None)
     _edit(ws, cid, stamp, choices=choices, customs=customs)
 
@@ -90,15 +107,19 @@ def _selector(ws, child, requirement, disabled):
     cid, rid = child["id"], requirement["id"]
     widget = f"dq_choice:{cid}:{rid}"
     chosen = _mapping(ws, cid, "choices").get(rid, requirement.get("selected"))
-    index = next((n for n, o in enumerate(options) if chosen == {k: o[k] for k in ("path", "code")}), None)
+    catalog = ws.catalog
+    index = next((n for n, o in enumerate(options) if chosen == option_identity(catalog, o)), None)
     st.session_state[widget] = index
     st.selectbox("合法候選 — " + requirement["text"], list(range(len(options))), index=index,
                  format_func=lambda n: options[n]["path"] + " / " + options[n]["code"] + " — " + options[n]["codsc"],
                  key=widget, disabled=disabled, placeholder="請人工選擇，不預選第一筆",
-                 on_change=_callback, args=(_choose, ws, cid, rid, widget, options))
+                 on_change=_callback, args=(_choose, ws, cid, rid, widget, options),
+                 kwargs={"origin": (child["source_digest"], child["catalog_digest"])})
 
 
 def _custom(ws, child, requirement, disabled):
+    if requirement["kind"] in {"constraint", "units", "external_confirmation"}:
+        return  # 這些不是缺少客製零件；不得提供核心不會消耗的 no-op 表單。
     cid, rid = child["id"], requirement["id"]
     old = _mapping(ws, cid, "customs").get(rid, {})
     paths = requirement.get("custom_paths")
@@ -139,17 +160,25 @@ def _custom(ws, child, requirement, disabled):
 def _resolutions(ws, child, disabled):
     # 每個片段只畫一次；共用片段明確逐張確認，不隱式套用全部。
     fragments = {}
+    external = set()
     for req in child["requirements"]:
         source = req.get("source") or {}
         if source.get("fragment_id"):
             fragments[source["fragment_id"]] = source
+            if req["kind"] == "external_confirmation":
+                external.add(source["fragment_id"])
     for rid, source in fragments.items():
+        if rid in external:
+            st.info(f"原文第 {source['line']} 行待圖面／訂單核對：{source['original']}。"
+                    "目前保留待核對；不提供客製或外部確認重述捷徑，不可為通過而忽略需求。")
+            continue
         old = _mapping(ws, child["id"], "resolutions").get(rid, {})
         prefix = f"dq_resolution:{child['id']}:{rid}"
         with st.expander(f"明確重述與範圍確認 — 原文第 {source['line']} 行"):
             st.text(source["original"])
-            st.text(f"原範圍：{source['scope']}；本次重述只套用第 {child['ordinal']} 張（群組 {child['group']}）。")
+            st.text(f"原範圍：{semantic_text(source['scope'])}；本次重述只套用第 {child['ordinal']} 張（群組 {child['group']}）。")
             st.caption("重述仍經同一規則解析器；不可用『忽略』『備註』或刪除文字代替需求。其他張需分別確認。")
+            st.caption("待單位需先人工核對，再以含明確單位的完整片段重述，保留外型、部位、孔數等所有需求；不自動換算台尺。")
             with st.form(prefix):
                 text = st.text_area("精確重述完整片段", value=old.get("text", ""), key=prefix + ":text", disabled=disabled)
                 confirmed = st.checkbox("確認完整保留需求，且只作用於本張", key=prefix + ":scope", disabled=disabled)
@@ -183,7 +212,8 @@ def _cost_editor(ws, child, disabled):
                 value = override.get(field, item.get(field))
                 st.session_state[widget] = "" if value is None else str(value)
                 st.text_input(label, key=widget, disabled=disabled, on_change=_callback,
-                              args=(_cost, ws, cid, path, field, widget))
+                              args=(_cost, ws, cid, path, field, widget),
+                              kwargs={"origin": (child["source_digest"], child["catalog_digest"])})
             st.caption("輸入失焦／Enter 即套用並撤銷本張舊固定；不提供直接編輯總額。空白不等於0。")
 
 
@@ -195,8 +225,21 @@ def _download(child, catalog, *, receipt=None, key):
 
 
 def _show(child, catalog, *, receipt=None, key):
+    if receipt is not None:
+        child = receipt["document"]["child"]
+        catalog = receipt["document"]["context"]["catalog_snapshot"]
     st.text(child["description"])
     st.text(f"來源行 {child['source_line']}／群組 {child['group']}／成品數 {child['product_qty']}")
+    if "normalized_requirements" in child:
+        st.text(f"產品角色：{semantic_text(child.get('role')) or '未指定'}／外型：{semantic_text(child.get('shape')) or '未指定'}")
+        with st.expander("語意解析／適用部位", expanded=True):
+            st.caption("適用品項為同群組內序號，不是件數。共用為預設，特定／品項優先；覆寫來源仍保留。"
+                       "已匹配不等於成本完整；限制片數不計為付費孔數，未適用／衝突／待單位不推算總量。")
+            st.dataframe(semantic_rows(child), hide_index=True, width="stretch")
+        with st.expander("語意解析原始欄位（含来源、候選及關聯需求）"):
+            st.json(child["normalized_requirements"])
+    else:
+        st.caption("舊版歷史未記錄語意解析／適用部位；依原固定明細顯示，不以新版解析器補算。")
     st.dataframe(screen_rows(child, catalog, receipt=receipt), hide_index=True, width="stretch")
     calc = child["calc"]
     if child["ready"]:
@@ -226,7 +269,7 @@ def _child(ws, child, store):
         st.success("本張已保存，修改與再次保存已停用；歷史不重查價。")
     with st.expander("合法規格候選／本次臨時件", expanded=not child["ready"]):
         for req in child["requirements"]:
-            if req["kind"] in {"constraint", "units"}:
+            if req["kind"] in {"constraint", "units", "external_confirmation"}:
                 continue
             _selector(ws, child, req, disabled)
             if not req.get("candidates") or req["id"] in _mapping(ws, cid, "customs"):
@@ -241,7 +284,7 @@ def _child(ws, child, store):
                  disabled=disabled or not child["ready"] or frozen is not None or bool(blocked)):
         try:
             stamp = audit()
-            # choices 契約只有 path/code。UI 的完整事件鏈放在既有 frozen_audit.reason，
+            # choices 僅含 path/code，重複代碼再帶 codsc；完整事件鏈放在 frozen_audit.reason，
             # 不向核心塞入未支援的 choices 欄位；歷史下載可重讀所有人員／原因／時間。
             reason = json.dumps({"reason": stamp["reason"], "source": st.session_state.get("dq_source_audit"),
                                  "ui_events": st.session_state.get("dq_events", {}).get(cid, [])}, ensure_ascii=False)
@@ -345,7 +388,10 @@ def main():
     st.button("開始新工單（不更改已保存歷史）", key="dq_new", on_click=_new_source)
     category = st.selectbox("產品類別", list(names), index=None, format_func=names.get, key="dq_category", disabled=locked)
     source = st.text_area("貼上工單需求（任意品項）", height=180, key="dq_source", disabled=category is None or locked,
-                          placeholder="平直70X120-----2\n平直70X150-----3\n共用：面無孔")
+                          placeholder="平直70X120-----2\n平直70X150-----3\n共用：\n面無孔\n817胡／噴胡",
+                          help="可單獨一行『共用：』開啟多行區塊，也可每行『共用：條件』。區塊至新品項、新工單或明示範圍結束；空行不結束。")
+    st.caption("共用區塊不必每行重複標頭；條件套用同工單群組的適用品項。"
+               "『主席及彎角桌…』『列席桌…』可置於品項之間；『第N項：』『局部：』『配件：』明示特定範圍。")
     if not locked:
         if category is None and ws.category is not None:
             ws = DynamicWorkspace()
@@ -377,7 +423,8 @@ def main():
         for issue in analysis["global_issues"]:
             st.text(issue["message"])
         if analysis["global_issues"]:
-            st.warning("原文行未確認作用範圍時，請先在原文明示『共用：』『第N項：』或『配件：』，再分析；不提供忽略。")
+            st.warning("原文行未確認作用範圍時，請以獨立『共用：』標頭開啟多行區塊，或每行『共用：條件』；"
+                       "特定條件可用『第N項：』『配件：』。區塊至新品項、新工單或明示範圍結束，空行不結束；不提供忽略。")
         st.caption("成本：依每件量或本張總量 × 用料量 ÷ 裁切量 × 採購單價；乘主檔係數、折扣0%、外加5%稅。")
         children = analysis["children"]
         if children:

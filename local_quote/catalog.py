@@ -25,7 +25,7 @@ def number(value, label, *, positive=False):
     return converted
 
 
-def build_catalog(workgroup, category, tables):
+def build_catalog(workgroup, category, tables, *, allow_code_variants=False):
     """驗證同工作群、類別內完整直接父子樹；不推測缺少的主檔內容。"""
     category = deepcopy(category)
     code = category.get("prodkind")
@@ -76,13 +76,17 @@ def build_catalog(workgroup, category, tables):
         path = row.get("path")
         if path not in nodes:
             continue
-        if (not isinstance(row.get("code"), str) or not row["code"]
-                or not isinstance(row.get("codsc"), str) or not row["codsc"].strip()
-                or any(o["code"] == row["code"] for o in options[path])):
-            raise ValueError("同一路徑的規格代碼或名稱缺少／不唯一")
+        if (not isinstance(row.get("code"), str) or not row["code"].strip()
+                or not isinstance(row.get("codsc"), str) or not row["codsc"].strip()):
+            raise ValueError("規格代碼或名稱缺少：" + path)
+        repeated = [o for o in options[path] if o["code"] == row["code"]]
+        if any(o["codsc"] == row["codsc"] for o in repeated):
+            raise ValueError("同一路徑、規格代碼與名稱重複：" + path + " / " + row["code"])
+        if repeated and not allow_code_variants:
+            raise ValueError("同一路徑的規格代碼不唯一：" + path + " / " + row["code"])
         options[path].append(row)
     for values in options.values():
-        values.sort(key=lambda r: r["code"])
+        values.sort(key=lambda r: (r["code"], r["codsc"]))
     rules = {p: [] for p in nodes}
     for row in rows("ordqty"):
         if row.get("path") in nodes:
@@ -94,6 +98,15 @@ def build_catalog(workgroup, category, tables):
 
 def path_label(catalog, path):
     return " / ".join(catalog["labels"][p] for p in path.split("\\")[1:])
+
+
+def option_identity(catalog, option):
+    """同路徑代碼有不同名稱時，以完整主檔識別區分；不接受價格作識別。"""
+    identity = {key: option[key] for key in ("path", "code")}
+    peers = [o for o in catalog["options"].get(option["path"], []) if o["code"] == option["code"]]
+    if len(peers) > 1:
+        identity["codsc"] = option["codsc"]
+    return identity
 
 
 def entries(catalog, path):

@@ -42,8 +42,9 @@ PER_ITEM_OPTIONS = frozenset({"S010", "S015", "S020", "S022", "S025", "S030", "S
 
 class MasterSource:
     """唯一 SQL 邊界。只使用呼叫者注入的 db.read()，不建立一般 DB 連線。"""
-    def __init__(self, db):
+    def __init__(self, db, *, allow_code_variants=False):
         self.db = db
+        self.allow_code_variants = allow_code_variants
 
     def categories(self):
         with self.db.read() as conn:
@@ -79,7 +80,8 @@ class MasterSource:
                 if len(rows) > 20000:
                     raise ValueError("所選主檔超過單次讀取上限；不能以截斷資料報價")
                 tables[table] = [dict(r) for r in rows]
-        return build_catalog(self.db.workgroup, dict(categories[0]), tables)
+        return build_catalog(self.db.workgroup, dict(categories[0]), tables,
+                             allow_code_variants=self.allow_code_variants)
 
 
 def _json(value):

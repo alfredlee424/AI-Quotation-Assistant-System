@@ -17,6 +17,7 @@ from streamlit.testing.v1 import AppTest
 from local_quote import dynamic_ui as ui
 from local_quote.backend import LocalDatabase
 from local_quote.dynamic_storage import DynamicStore
+from local_quote.dynamic_workflow import DynamicWorkspace
 from local_quote.storage import BatchStore, freeze_preview
 from test_local_dynamic import fixture, SOURCE, ROOT, BOARD, BOX
 from test_local_storage import SETTINGS, fixture_schema, preview
@@ -218,6 +219,24 @@ class DynamicUITests(unittest.TestCase):
         events = json.loads(json.loads(frozen.payload)["frozen_audit"]["reason"])["ui_events"]
         self.assertTrue(any("choices" in e["after"] and e["actor"] == "tester" for e in events))
 
+    def test_same_code_different_names_ui_choice_keeps_full_identity_and_price(self):
+        for option in self.master.cat["options"][BOX]:
+            option["code"] = "SAME"
+        cid = self.fill(SOURCE + "\n配件：線盒共3個")[0]["id"]
+        req = next(r for r in self.ws.analysis["children"][0]["requirements"] if r["text"] == "線盒")
+        index = next(i for i, o in enumerate(req["candidates"]) if o["codsc"] == "黑線盒")
+        key = f"dq_choice:{cid}:{req['id']}"
+        self.assertIsNone(self.app.selectbox(key=key).value)
+        self.app.selectbox(key=key).select(index).run()
+        self.clean()
+        self.assertEqual(self.app.selectbox(key=key).value, index)
+        choice = self.ws.analysis["context"]["inputs"]["choices"][cid][req["id"]]
+        self.assertEqual(choice, dict(path=BOX, code="SAME", codsc="黑線盒"))
+        self.freeze(cid)
+        self.save(cid)
+        row = next(i for i in self.ws.saved[cid]["document"]["child"]["items"] if i["path"] == BOX)
+        self.assertEqual((row["codsc"], row["compri"]), ("黑線盒", "140"))
+
     def test_unknown_resolution_requires_confirmed_single_child_scope(self):
         a, b = [c["id"] for c in self.fill(SOURCE + " 未知加工\n" + SOURCE + " 未知加工")]
         child = self.ws.analysis["children"][0]
@@ -269,6 +288,50 @@ class DynamicUITests(unittest.TestCase):
         self.assertIsNone(self.app.selectbox(key="dq_category").value)
         self.assertFalse(self.ws.saved)
         self.assertEqual(len(self.store.list_saved()), 1)
+
+    def test_late_choice_callback_after_analysis_cleared_can_reanalyze(self):
+        child = self.fill(SOURCE + "\n配件：線盒共3個")[0]
+        req = next(r for r in child["requirements"] if r["text"] == "線盒")
+        selector = self.app.selectbox(key=f"dq_choice:{child['id']}:{req['id']}")
+        revised = "平直70X150-----6"
+        # 模擬來源已失效，但瀏覽器上一輪候選事件仍在佇列。
+        self.ws.set_input(revised, "CMT1")
+        self.assertIsNone(self.ws.analysis)
+        selector.select(0)
+        self.app.text_area(key="dq_source").input(revised)
+        self.click("dq_analyze")
+        new = self.ws.analysis["children"][0]
+        self.assertEqual(new["product_qty"], 6)
+        self.assertTrue(new["ready"])
+        self.assertNotIn(BOX, new["selections"])
+        self.assertFalse(self.ws.analysis["context"]["inputs"]["choices"])
+        self.assertFalse(self.app.session_state["dq_blocked"])
+        self.assertFalse(any(s.startswith("INSERT") for s in self.sql))
+
+    def test_source_and_choice_same_rerun_rejects_old_edit_before_main(self):
+        child = self.fill(SOURCE + "\n配件：線盒共3個")[0]
+        req = next(r for r in child["requirements"] if r["text"] == "線盒")
+        self.app.selectbox(key=f"dq_choice:{child['id']}:{req['id']}").select(0)
+        self.app.text_area(key="dq_source").input("平直70X150-----7")
+        with patch.object(self.ws, "edit", wraps=self.ws.edit) as edit:
+            self.click("dq_analyze")
+            edit.assert_not_called()
+        self.assertEqual(self.ws.analysis["children"][0]["product_qty"], 7)
+        self.assertFalse(self.ws.analysis["context"]["inputs"]["choices"])
+
+    def test_late_cost_callback_after_analysis_cleared_can_reanalyze(self):
+        child = self.fill(SOURCE)[0]
+        self.freeze(child["id"])
+        cost = self.app.text_input(key=f"dq_cost:{child['id']}:{BOARD}:compri")
+        revised = "平直70X150-----4"
+        self.ws.set_input(revised, "CMT1")
+        cost.input("999")
+        self.app.text_area(key="dq_source").input(revised)
+        self.click("dq_analyze")
+        self.assertFalse(self.ws.frozen)
+        self.assertFalse(self.ws.analysis["context"]["inputs"]["overrides"])
+        board = next(i for i in self.ws.analysis["children"][0]["items"] if i["path"] == BOARD)
+        self.assertEqual(board["compri"], "700")
 
     def test_bad_numeric_input_revokes_and_blocks_instead_of_using_previous_value(self):
         cid = self.fill(SOURCE)[0]["id"]
@@ -332,6 +395,56 @@ class DynamicUITests(unittest.TestCase):
             self.assertTrue(all(r["ref_no"] == receipt["ref_no"] and r["usrno"] == "tester" for r in rows))
             self.assertIn("正式已保存", label)
             self.assertTrue(filename.startswith("saved-"))
+
+
+class CallbackGuardTests(unittest.TestCase):
+    """保留相同 child id 的重載也必須拒絕舊來源／主檔版本，不能只驗 id。"""
+    def setUp(self):
+        self.ws = DynamicWorkspace()
+        self.ws.set_input({"text": SOURCE, "document_id": "stable-source"}, "CMT1")
+        self.ws.load_catalog(fixture())
+        self.child = self.ws.analysis["children"][0]
+        self.origin = (self.child["source_digest"], self.child["catalog_digest"])
+
+    def assert_rejected(self, *, current=None, category="CMT1"):
+        current = current or self.ws
+        before = current.analysis
+        state = dict(dq_workspace=current, dq_source=current.source["text"], dq_category=category,
+                     dq_actor="tester", dq_reason="核對", cost="999", dq_blocked={})
+        with patch.object(ui.st, "session_state", state), patch.object(self.ws, "edit", wraps=self.ws.edit) as edit:
+            ui._callback(ui._cost, self.ws, self.child["id"], BOARD, "compri", "cost", origin=self.origin)
+            edit.assert_not_called()
+        self.assertEqual(current.analysis, before)
+        self.assertFalse(state["dq_blocked"])
+        self.assertIn("未套用", state["dq_notice"])
+
+    def test_mapping_empty_analysis_is_explicit_validation_error(self):
+        self.ws.set_input("平直70X150-----4", "CMT1")
+        with self.assertRaisesRegex(ValueError, "分析已失效"):
+            ui._mapping(self.ws, self.child["id"], "choices")
+
+    def test_old_source_version_rejected_even_with_same_child_id(self):
+        self.ws.set_input({"text": "平直70X150-----4", "document_id": "stable-source"}, "CMT1")
+        self.ws.load_catalog(fixture())
+        self.assertEqual(self.child["id"], self.ws.analysis["children"][0]["id"])
+        self.assert_rejected()
+
+    def test_old_catalog_version_rejected_even_with_same_child_id(self):
+        cat = fixture()
+        cat["options"][BOARD][0]["compri"] = "800"
+        self.ws.load_catalog(cat)
+        self.assertEqual(self.child["id"], self.ws.analysis["children"][0]["id"])
+        self.assert_rejected()
+
+    def test_old_workspace_rejected_after_new_workspace_created(self):
+        current = DynamicWorkspace()
+        current.set_input(self.ws.source, "CMT1")
+        current.load_catalog(fixture())
+        self.assertEqual(self.ws.analysis, current.analysis)
+        self.assert_rejected(current=current)
+
+    def test_category_change_before_main_rejects_callback(self):
+        self.assert_rejected(category=None)
 
 
 class IsolationTests(unittest.TestCase):

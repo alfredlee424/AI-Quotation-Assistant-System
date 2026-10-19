@@ -5,7 +5,7 @@ import io
 import unittest
 
 from local_quote.dynamic import analyze, freeze
-from local_quote.dynamic_presentation import FIELDS, report_rows, safe_cell, screen_rows, tsv
+from local_quote.dynamic_presentation import FIELDS, report_rows, safe_cell, screen_rows, semantic_rows, tsv
 from test_local_dynamic import fixture, SOURCE, BOARD, ROOT
 
 
@@ -59,6 +59,64 @@ class PresentationTests(unittest.TestCase):
         rows = screen_rows(child, cat)
         self.assertEqual(rows[0]["spdsc"], "'=1+1")
         self.assertEqual(child, before)
+
+
+class SemanticPresentationTests(unittest.TestCase):
+    def child(self, text, **kwargs):
+        from test_local_block_semantics import master
+        return analyze(text, master(**kwargs))["children"][0]
+
+    def test_override_conflict_and_duplicate_keep_all_origins(self):
+        child = self.child("平直70X120-----2 面808白橡\n共用：\n817胡")
+        rows = [r for r in semantic_rows(child) if r["需求類型"] == "面材"]
+        self.assertEqual([r["狀態"] for r in rows], ["已匹配", "已被覆寫"])
+        self.assertEqual([r["是否適用"] for r in rows], ["是", "否"])
+        self.assertEqual([r["優先級"] for r in rows], ["20", "10"])
+        self.assertEqual([r["可算本張總量"] for r in rows], ["2", ""])
+        self.assertEqual(rows[0]["覆寫需求"], rows[1]["需求識別"])
+        conflict = semantic_rows(self.child("平直70X120-----2 面808白橡/817胡"))
+        conflicts = [r for r in conflict if r["狀態"] == "衝突"]
+        self.assertEqual(len(conflicts), 2)
+        self.assertTrue(all(r["衝突需求"] and r["可算本張總量"] == "" for r in conflicts))
+        duplicate = semantic_rows(self.child("平直70X120-----2\n共用：817胡\n共用：817胡"))
+        self.assertTrue(any(r["狀態"] == "重複（不重計）" and r["可算本張總量"] == "" for r in duplicate))
+
+    def test_pending_master_unknown_and_matched_missing_price_not_ready(self):
+        rows = semantic_rows(self.child("平直70X121-----2 火星加工"))
+        self.assertIn("待主檔／候選確認", [r["狀態"] for r in rows])
+        self.assertIn("未知", [r["狀態"] for r in rows])
+        child = self.child("平直70X120-----2\n共用：817胡", missing_price=True)
+        self.assertFalse(child["ready"])
+        material = next(r for r in semantic_rows(child) if r["需求類型"] == "面材")
+        self.assertEqual(material["狀態"], "已匹配")
+        self.assertEqual(material["可算本張總量"], "2")
+        self.assertIn("817", material["已選規格"])
+        self.assertTrue(material["候選"] and material["關聯需求"] and material["可掛接部位"])
+
+    def test_all_semantic_cells_safe_and_snapshot_unchanged(self):
+        child = self.child("平直70X120-----2")
+        req = child["normalized_requirements"][0]
+        for field in ("value", "part", "kind", "attribute", "id", "status"):
+            req[field] = "\u200b＝1+1"
+        for field in ("raw", "text", "scope"):
+            req["origin"][field] = "\t@SUM(A1)"
+        for field in ("targets", "override", "conflict", "custom_paths", "requirement_ids"):
+            req[field] = ["=HYPERLINK(\"x\")"]
+        child["group"] = "-cmd|'x'!A0"
+        before = deepcopy(child)
+        row = semantic_rows(child)[0]
+        for field in ("需求", "部位", "需求類型", "屬性", "需求識別", "狀態", "來源原文", "解析片語", "範圍",
+                      "群組內適用品項", "覆寫需求", "衝突需求", "可掛接部位", "關聯需求", "群組"):
+            self.assertTrue(row[field].startswith("'"), (field, row[field]))
+        self.assertEqual(child, before)
+
+    def test_no_normalized_legacy_and_total_quantity_projection(self):
+        self.assertEqual(semantic_rows({"items": []}), [])
+        child = self.child("平直70X120-----2")
+        req = child["normalized_requirements"][0]
+        req.update(basis="total", quantity="3")
+        row = semantic_rows(child)[0]
+        self.assertEqual((row["每件量"], row["可算本張總量"], row["數量基準"]), ("", "3", "本張總量"))
 
 
 if __name__ == "__main__":
