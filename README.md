@@ -4,6 +4,8 @@
 
 本機入口已導向[新版 UI](local_quote/dynamic_ui.py)：[./venv/bin/python four_quote_acceptance.py --local-db](four_quote_acceptance.py:15)。先停止原服務後重啟；不加初始化旗標，不建表、不讀模型設定，仍使用全新程序及本機連線安全邊界。原[四張 UI](local_quote/ui.py)及舊歷史格式保留；新版頁面提供舊四張歷史唯讀查回。
 
+**Windows PowerShell：** 更新程式後使用 [.\venv\Scripts\python.exe .\four_quote_acceptance.py --local-db](four_quote_acceptance.py:15)。[本機啟動器](local_quote/bootstrap.py)已改為依作業系統選擇專案 Python；虛擬環境須在部署電腦建立，不能從 macOS 複製。首次安裝與 WinError 2 排除見[Windows 部署說明](docs/新版工單逐張報價操作說明.md)。
+
 **操作：選產品類別 → 貼任意品項工單 → 填操作人及原因 → 讀取主檔並分析 → 逐張處理候選、臨時規格、數量及成本 → 固定本張預覽 → 人工確認保存本張。** 草稿有缺項也顯示明細與「已知成本小計」，不冒稱完整合計；完整一張可先保存，其他未完成張不會被一起保存。修改某張會撤銷該張舊固定，錯誤重試保留同一 UUID，已保存張禁止修改／重複保存。
 
 - 本機語意是**規則＋合法候選，不是 LLM**。未知語句需明確重述並確認作用範圍；沒有忽略必選／刪除缺項捷徑。
