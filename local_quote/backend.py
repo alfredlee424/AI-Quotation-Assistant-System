@@ -1,10 +1,11 @@
-"""本機 MySQL 邊界與唯讀結構檢查。此模組沒有建表、修表或 seed 路徑。"""
+"""本機 MySQL / MSSQL 邊界與唯讀結構檢查；沒有建表、修表或 seed 路徑。"""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
+import socket
 
 from dotenv import dotenv_values
 from sqlalchemy import create_engine, event, inspect, text
@@ -19,6 +20,26 @@ class SchemaError(ValueError):
     """結構不符合保存合約。"""
 
 
+class ConnectionSettingsError(SettingsError):
+    """連線／登入／ODBC 失敗；只含固定安全訊息。"""
+
+
+def _connection_error(exc):
+    # 僅使用 SQLSTATE 分類，不顯示原始 driver 訊息、SQL、參數或連線字串。
+    original = getattr(exc, "orig", exc)
+    args = getattr(original, "args", ())
+    state = args[0] if args and isinstance(args[0], str) else ""
+    messages = {
+        "IM002": "找不到指定 ODBC 驅動；請安裝與 Python 位元相符的 Microsoft ODBC Driver 17／18。",
+        "IM003": "無法載入 ODBC 驅動；請檢查安裝及 Python／ODBC 位元版本。",
+        "28000": "資料庫登入失敗；請確認 SQL Server 帳密、混合驗證模式及資料庫存取權限。",
+        "08001": "無法建立資料庫連線；請檢查本機 SQL Server 服務、執行個體／連接埠及 TLS 憑證設定。",
+        "HYT00": "資料庫連線逾時；請檢查本機服務及執行個體／連接埠。",
+        "HYT01": "資料庫連線逾時；請檢查本機服務及執行個體／連接埠。",
+    }
+    return ConnectionSettingsError(messages.get(state, "無法連線本機資料庫；請確認設定、驅動程式與服務"))
+
+
 @dataclass(frozen=True)
 class Settings:
     db_conn_str: str = field(repr=False)
@@ -30,6 +51,8 @@ def _validated_url(value):
         if not isinstance(value, str) or any(ord(c) < 32 for c in value):
             raise ValueError
         url = make_url(value)
+        if url.drivername == "mssql+pyodbc":
+            return _mssql_url(url, value)
         if (url.drivername != "mysql+pymysql"
                 or url.host not in {"localhost", "127.0.0.1", "::1"}
                 or not url.database or "#" in value
@@ -39,7 +62,48 @@ def _validated_url(value):
             raise ValueError
         return url.update_query_dict({"charset": "utf8mb4"})
     except Exception:
-        raise SettingsError("只允許本機 mysql+pymysql 與 utf8mb4 連線設定") from None
+        raise SettingsError("只允許本機 mysql+pymysql（utf8mb4）或安全 mssql+pyodbc SQL 登入設定") from None
+
+
+def _mssql_url(url, raw):
+    # pyodbc 最終使用 ODBC connection string。拒絕欄位分隔／escape 字元，
+    # 而不是依賴各版本 dialect 對 UID/PWD/SERVER 的 quoting 差異。
+    fields = (url.host, url.database, url.username, url.password)
+    if ("#" in raw or any(not isinstance(v, str) or not v or
+            any(ord(c) < 32 or ord(c) == 127 or c in ";{}" for c in v) for v in fields)):
+        raise ValueError
+    host, *instance = url.host.lower().split("\\")
+    if host not in {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()}:
+        raise ValueError
+    if instance and (len(instance) != 1 or host == "::1" or url.port is not None
+                     or not re.fullmatch(r"[a-z][a-z0-9_]{0,15}", instance[0])):
+        raise ValueError
+    if url.port is not None and not 1 <= url.port <= 65535:
+        raise ValueError
+    options = {"driver": "driver", "encrypt": "Encrypt",
+               "trustservercertificate": "TrustServerCertificate", "longasmax": "LongAsMax"}
+    query = {}
+    for key, value in url.query.items():
+        canonical = options.get(key.lower())
+        if canonical is None or canonical in query or not isinstance(value, str):
+            raise ValueError
+        if canonical == "driver":
+            if value not in {"ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server"}:
+                raise ValueError
+        else:
+            value = value.lower()
+            if value not in ({"yes", "no"} if canonical == "TrustServerCertificate" else {"yes"}):
+                raise ValueError
+        query[canonical] = value
+    if "driver" not in query or ("LongAsMax" in query and "18" not in query["driver"]):
+        raise ValueError
+    query.setdefault("Encrypt", "yes")
+    query.setdefault("TrustServerCertificate", "no")
+    if "18" in query["driver"]:
+        query.setdefault("LongAsMax", "yes")
+    # SQLAlchemy URL 的 IPv6 host 已移除中括號；ODBC SERVER 需保留它們，
+    # 尤其同時帶有逗號分隔的 port 時。此 URL 物件直接交給 dialect。
+    return url.set(host="[::1]" if url.host == "::1" else url.host, query=query)
 
 
 def _workgroup(value):
@@ -106,8 +170,12 @@ PRIMARY_KEYS = {
 WRITE_TABLES = {"ordqdt_ai", "quote_snapshot_document"}
 
 
-def _check_schema(schema, *, testing=False):
+def _check_schema(schema, *, testing=False, dialect=None):
     """Validate normalized inspector facts; fail closed, without emitting data."""
+    if dialect == "mssql" or (not testing and any(
+            f.get("engine") == "mssql" for f in schema.values())):
+        from .mssql_schema import check_schema
+        return check_schema(schema)
     errors = []
     for table, expected in REQUIRED_COLUMNS.items():
         actual = schema.get(table)
@@ -157,7 +225,7 @@ def _check_schema(schema, *, testing=False):
 class LocalDatabase:
     def __init__(self, settings: Settings, *, engine=None, testing: bool = False):
         self.workgroup = _workgroup(settings.workgroup)
-        _validated_url(settings.db_conn_str)
+        url = _validated_url(settings.db_conn_str)
         if engine is not None:
             if testing is not True or engine.dialect.name != "sqlite":
                 raise SettingsError("注入引擎只限明確 testing=True 的隔離 SQLite")
@@ -165,28 +233,80 @@ class LocalDatabase:
         else:
             if testing:
                 raise SettingsError("測試必須注入隔離 SQLite 引擎")
-            self.engine = create_engine(
-                _validated_url(settings.db_conn_str), pool_pre_ping=True,
-                hide_parameters=True, echo=False,
-                connect_args={"connect_timeout": 5, "read_timeout": 15, "write_timeout": 15},
-            )
+            try:
+                self.engine = create_engine(
+                    url, pool_pre_ping=True, hide_parameters=True, echo=False,
+                    connect_args=({"timeout": 5} if url.drivername == "mssql+pyodbc" else
+                                  {"connect_timeout": 5, "read_timeout": 15, "write_timeout": 15}),
+                )
+                if url.drivername == "mssql+pyodbc":
+                    event.listen(self.engine, "connect", self._mssql_timeout)
+            except Exception:
+                raise SettingsError("無法建立本機資料庫引擎；請確認已安裝指定的資料庫驅動程式") from None
         self.testing = testing
+        self._numeric_profile = "binary64" if testing else "binary32"
+        self._write_capacities = None
+        if not testing and url.drivername == "mssql+pyodbc":
+            self._numeric_profile = None  # 必須完成 schema 檢查，不猜測精度。
+
+    @staticmethod
+    def _mssql_timeout(dbapi_connection, connection_record):
+        dbapi_connection.timeout = 15  # pyodbc query timeout；login timeout 在 connect_args。
+
+    @property
+    def numeric_profile(self):
+        """binary32 / binary64；MSSQL 在成功 inspect_schema 後才可使用。"""
+        if self._numeric_profile is None:
+            raise SchemaError("必須先完成 MSSQL 結構檢查才能判定數值精度")
+        return self._numeric_profile
+
+    def validate_write_values(self, table, values):
+        """MSSQL 保存前逐列檢查實際編碼 bytes 與往返；不截斷、不轉碼補字。
+
+        呼叫端須在同一保存交易 inspect_schema 後、任何 INSERT 前檢查全部列。
+        文字參數須以 Unicode 綁定（含 UTF-8 varchar），不可先轉 ANSI bytes。
+        MySQL / SQLite 保留原保存層既有容量政策。
+        """
+        if self.engine.dialect.name != "mssql":
+            return
+        from .mssql_schema import validate_write_values
+        validate_write_values(self._write_capacities, table, values)
 
     @contextmanager
     def read(self):
-        """Yield a SQLAlchemy Connection; transaction control/writes are forbidden."""
-        with self.engine.connect() as conn:
+        """程式唯讀，不是 MSSQL 伺服器 read-only 或敵意 Python 的安全沙箱。
+
+        MSSQL SERIALIZABLE 確保同交易主檔可序列化一致性（可能持有讀鎖）；
+        不需預先啟用 SNAPSHOT。不允許呼叫端鎖提示或自行結束交易。
+        """
+        try:
+            connection = self.engine.connect()
+        except Exception as exc:
+            raise _connection_error(exc) from None
+        with connection as conn:
             def no_transaction_control(connection):
                 raise ValueError("唯讀連線不得自行結束交易")
 
             def guard(connection, cursor, statement, parameters, context, executemany):
                 sql = statement.strip().rstrip(";")
                 if (not re.match(r"^(SELECT|SHOW|DESCRIBE)\b", sql, re.I)
-                        or re.search(r";|\b(INTO|FOR\s+UPDATE|LOCK\s+IN|GET_LOCK|RELEASE_LOCK)\b", sql, re.I)):
+                        or re.search(r";|--|/\*|\*/|\b(INTO|INSERT|UPDATE|DELETE|MERGE|EXEC(?:UTE)?|"
+                                     r"COMMIT|ROLLBACK|SAVEPOINT|SET|ALTER|CREATE|DROP|TRUNCATE|"
+                                     r"GRANT|REVOKE|DENY|BACKUP|RESTORE|DBCC|WAITFOR|"
+                                     r"LOCK\s+IN|GET_LOCK|RELEASE_LOCK|UPDLOCK|XLOCK|HOLDLOCK|"
+                                     r"TABLOCKX?|ROWLOCK|PAGLOCK|NOLOCK|READUNCOMMITTED|"
+                                     r"READCOMMITTED(?:LOCK)?|REPEATABLEREAD|SERIALIZABLE|"
+                                     r"SNAPSHOT|READPAST|NOWAIT|OPENROWSET|OPENQUERY|"
+                                     r"OPENDATASOURCE|NEXT\s+VALUE|OPTION)\b", sql, re.I)):
                     raise ValueError("唯讀連線只允許查詢")
             try:
                 if self.testing:
                     conn.exec_driver_sql("PRAGMA query_only=ON")
+                elif self.engine.dialect.name == "mssql":
+                    conn.execution_options(isolation_level="SERIALIZABLE")
+                    conn.begin()
+                    from .mssql_schema import check_context
+                    check_context(conn)
                 else:
                     conn.exec_driver_sql("START TRANSACTION READ ONLY")
                 event.listen(conn, "before_cursor_execute", guard)
@@ -200,6 +320,11 @@ class LocalDatabase:
                     if event.contains(conn, name, no_transaction_control):
                         event.remove(conn, name, no_transaction_control)
                 try:
+                    # SQLAlchemy 在 commit/rollback event 拋錯時仍可能取消
+                    # RootTransaction；這時 Connection.rollback() 是 no-op，
+                    # 但 DBAPI 交易尚未結束。明確 rollback，不只依賴 pool reset。
+                    if self.engine.dialect.name == "mssql" and not conn.in_transaction():
+                        conn.connection.rollback()
                     conn.rollback()
                     if self.testing:
                         conn.exec_driver_sql("PRAGMA query_only=OFF")
@@ -210,6 +335,22 @@ class LocalDatabase:
 
     def inspect_schema(self, connection=None):
         """No DDL. Save calls this again on its locked transaction connection."""
+        if not self.testing and self.engine.dialect.name == "mssql":
+            self._numeric_profile, self._write_capacities = None, None
+            try:
+                if connection is None:
+                    with self.read() as conn:
+                        return self.inspect_schema(conn)
+                result = _check_schema(self._mssql_schema(connection), dialect="mssql")
+                self._numeric_profile = result["numeric_profile"]
+                self._write_capacities = result["write_capacities"]
+                return result
+            except (SettingsError, SchemaError):
+                self._numeric_profile, self._write_capacities = None, None
+                raise
+            except Exception:
+                self._numeric_profile, self._write_capacities = None, None
+                raise SchemaError("MSSQL 結構檢查失敗；請確認 metadata 權限與既有七表結構") from None
         if connection is None:
             if self.testing:
                 # SQLite inspector requires read-only PRAGMA metadata statements.
@@ -222,6 +363,11 @@ class LocalDatabase:
                 return self.inspect_schema(conn)
         facts = self._sqlite_schema(connection) if self.testing else self._mysql_schema(connection)
         return _check_schema(facts, testing=self.testing)
+
+    @staticmethod
+    def _mssql_schema(conn):
+        from .mssql_schema import inspect_schema
+        return inspect_schema(conn)
 
     @staticmethod
     def _mysql_schema(conn):

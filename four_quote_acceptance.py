@@ -1,4 +1,4 @@
-"""明確分流本機 MySQL 與隔離驗收；不匯入一般應用。"""
+"""明確分流本機 MySQL／MSSQL 與隔離驗收；不匯入一般應用。"""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="工單報價：本機逐張主檔或四張私有隔離驗收", allow_abbrev=False)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--directory", help="私有隔離 SQLite 驗收目錄")
-    mode.add_argument("--local-db", action="store_true", help="本機 MySQL 工單逐張報價；僅 UI 確認後保存")
+    mode.add_argument("--local-db", action="store_true", help="依 .env 連線本機 MySQL／MSSQL；僅 UI 確認後保存")
     parser.add_argument("--initialize", action="store_true", help="只接受全新私有目錄")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)

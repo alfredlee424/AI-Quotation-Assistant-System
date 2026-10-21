@@ -38,7 +38,9 @@ from sqlalchemy import text
 from . import dynamic
 from .backend import LocalDatabase, SchemaError
 from .storage import (StorageError, TEXT_BYTES, _canonical, _digest, _hex, _iso,
-                      _mysql_lock, _now, _number, _require, _sqlite_lock, _string)
+                      _mssql_lock, _mysql_lock, _now, _number, _require, _sqlite_lock, _string)
+from .sql_dialect import (insert_statement, is_mssql, limited_select, lock_suffix,
+                          lock_table, numeric_column)
 
 
 DOCUMENT_TYPE = "local_dynamic_saved_child"
@@ -291,12 +293,17 @@ class DynamicStore:
 
     @property
     def _profile(self):
+        if is_mssql(self.db):
+            profile = self.db.numeric_profile
+            _require(profile in ("binary32", "binary64"), "MSSQL 數值儲存規格不符")
+            return profile
         return "binary64" if self.db.testing else "binary32"
 
     def _fetch(self, conn, confirmation_id):
         # 同一 SELECT 擷取文件＋全部明細：SQLite legacy transaction mode 與
         # MySQL READ COMMITTED 亦不會在兩次查詢間拼湊不同時點。
-        columns = [f"q.{k} + 0e0 AS {k}" if k in NUMERIC_FIELDS else f"q.{k} AS {k}" for k in ROW_FIELDS]
+        columns = [(numeric_column(self.db, f"q.{k}") if k in NUMERIC_FIELDS else f"q.{k}") +
+                   f" AS {k}" for k in ROW_FIELDS]
         return conn.execute(text(
             "SELECT d.workgroup AS doc_workgroup, d.preview_id AS doc_id, d.ref_no AS doc_ref, "
             "d.payload AS doc_payload, " + ",".join(columns) +
@@ -310,8 +317,11 @@ class DynamicStore:
         row = rows[0]
         payload = row["doc_payload"]
         snapshot = _load_snapshot(payload)
+        # MSSQL history is self-contained; fresh read-only services need not inspect masters.
+        valid_profile = (snapshot["numeric_storage"] in ("binary32", "binary64") if is_mssql(self.db)
+                         else snapshot["numeric_storage"] == self._profile)
         _require(snapshot["confirmation_id"] == _uuid(confirmation_id) and
-                 snapshot["workgroup"] == self.db.workgroup and snapshot["numeric_storage"] == self._profile,
+                 snapshot["workgroup"] == self.db.workgroup and valid_profile,
                  "歷史 UUID／工作群／數值儲存規格不符")
         _require(isinstance(snapshot["ref_no"], str) and _REF.fullmatch(snapshot["ref_no"]) is not None
                  and snapshot["ref_no"][-3:] != "000", "新版單號不符")
@@ -334,9 +344,9 @@ class DynamicStore:
         prefix = "DQ" + _now().strftime("%Y%m%d%H%M%S") + "_"
         used = set()
         for table in ("ordqdt_ai", "quote_snapshot_document"):
-            suffix = "" if self.db.testing else " FOR UPDATE"
+            suffix = lock_suffix(self.db)
             # range 而非 LIKE：底線不是萬用字元，且跨 workgroup 查碰撞。
-            used.update(conn.execute(text(f"SELECT ref_no FROM {table} "
+            used.update(conn.execute(text(f"SELECT ref_no FROM {lock_table(self.db, table)} "
                                           "WHERE ref_no>=:lo AND ref_no<=:hi" + suffix),
                                      {"lo": prefix + "001", "hi": prefix + "999"}).scalars())
         for seq in range(1, 1000):
@@ -346,8 +356,8 @@ class DynamicStore:
         raise StorageError("本秒單張配號已滿；請保留同一固定 UUID 稍後重試")
 
     def _insert_items(self, conn, snapshot):
-        conn.execute(text("INSERT INTO ordqdt_ai (" + ",".join(ROW_FIELDS) + ") VALUES (" +
-                          ",".join(":" + k for k in ROW_FIELDS) + ")"), _database_rows(snapshot))
+        rows = _database_rows(snapshot)
+        conn.execute(insert_statement(self.db, "ordqdt_ai", rows[0]), rows)
 
     def save(self, frozen, *, confirmed, current, trusted_catalog_digest):
         """同一 UUID＋相同內容回原 receipt；任何衝突／殘缺都拒絕補存。"""
@@ -359,10 +369,11 @@ class DynamicStore:
         _require(document["context"]["catalog_snapshot"]["workgroup"] == self.db.workgroup, "工作群不符")
         try:
             with self.db.engine.connect() as conn:
-                lock = _sqlite_lock(self.db.engine) if self.db.testing else _mysql_lock(conn)
+                lock = (_mssql_lock(conn) if is_mssql(self.db) else
+                        _sqlite_lock(self.db.engine) if self.db.testing else _mysql_lock(conn))
                 with lock:
                     # BEGIN IMMEDIATE 跨 engine／跨程序亦串行配號，不只 Python lock。
-                    if self.db.testing:
+                    if self.db.testing and not is_mssql(self.db):
                         conn.exec_driver_sql("BEGIN IMMEDIATE")
                     else:
                         conn.begin()
@@ -377,11 +388,14 @@ class DynamicStore:
                             snapshot = _snapshot(frozen, document, self.db.workgroup, self._allocate_ref(conn),
                                                  _now().isoformat(timespec="microseconds"), self._profile)
                             payload = _capacity(snapshot)
-                            _database_rows(snapshot)  # schema/數值預檢在任何 INSERT 之前
-                            conn.execute(text("INSERT INTO quote_snapshot_document "
-                                              "(workgroup,preview_id,ref_no,payload) VALUES (:wg,:id,:ref,:payload)"),
-                                         dict(wg=self.db.workgroup, id=frozen.confirmation_id,
-                                              ref=snapshot["ref_no"], payload=payload))
+                            rows = _database_rows(snapshot)  # 全部預檢在任何 INSERT 之前
+                            header = dict(workgroup=self.db.workgroup, preview_id=frozen.confirmation_id,
+                                          ref_no=snapshot["ref_no"], payload=payload)
+                            if is_mssql(self.db):
+                                self.db.validate_write_values("quote_snapshot_document", header)
+                                for row in rows:
+                                    self.db.validate_write_values("ordqdt_ai", row)
+                            conn.execute(insert_statement(self.db, "quote_snapshot_document", header), header)
                             self._insert_items(conn, snapshot)
                             verified = self._decode(self._fetch(conn, frozen.confirmation_id), frozen.confirmation_id)
                             _require(verified == snapshot, "保存讀回的完整邏輯快照不符")
@@ -416,8 +430,8 @@ class DynamicStore:
                 result, cursor = [], None
                 while len(result) < limit:
                     where = "workgroup=:wg" + (" AND ref_no<:cursor" if cursor else "")
-                    rows = conn.execute(text("SELECT preview_id,ref_no,payload FROM quote_snapshot_document WHERE " +
-                                             where + " ORDER BY ref_no DESC LIMIT 100"),
+                    rows = conn.execute(text(limited_select(self.db, "preview_id,ref_no,payload",
+                                             "quote_snapshot_document WHERE " + where + " ORDER BY ref_no DESC", 100)),
                                         {"wg": self.db.workgroup, "cursor": cursor}).mappings().all()
                     if not rows:
                         break

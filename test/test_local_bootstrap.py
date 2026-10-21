@@ -112,3 +112,46 @@ assert len(seen) == 1 and not seen[0].exists()
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("settings", "設定或驅動檢查未通過"),
+    ("schema", "既有資料表不相容"),
+    ("driver", "ODBC"),
+    ("login", "登入失敗"),
+    ("unknown", "請檢查已安裝的專案套件"),
+])
+def test_worker_startup_diagnostics_disposes_engine_and_never_echoes_driver(kind, expected):
+    code = '''
+import sys, socket
+sys.path.insert(0, sys.argv[1])
+from types import SimpleNamespace
+from local_quote import bootstrap as b, backend
+socket.socket.connect = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network"))
+backend.dotenv_values = lambda *a, **k: (_ for _ in ()).throw(AssertionError("private settings"))
+backend.load_settings = lambda path: None
+kind = sys.argv[2]
+errors = {
+    "settings": backend.SettingsError("WORKGROUP 必須為 1 至 3 字元"),
+    "schema": backend.SchemaError("ordqdt_ai: missing table"),
+    "driver": backend._connection_error(RuntimeError("IM002", "secret-canary")),
+    "login": backend._connection_error(RuntimeError("28000", "secret-canary")),
+    "unknown": RuntimeError("secret-canary-server-password-query"),
+}
+disposed = []
+def inspect():
+    raise errors[kind]
+backend.LocalDatabase = lambda settings: SimpleNamespace(
+    inspect_schema=inspect, engine=SimpleNamespace(dispose=lambda: disposed.append(True)))
+b.runpy.run_module = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not start UI"))
+assert b.launch(worker=True) == 2
+assert disposed == [True]
+assert not any(n in sys.modules for n in ("config", "database.connection", "acceptance.bootstrap"))
+'''
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code, str(bootstrap.ROOT), kind],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stderr
+    assert "secret-canary" not in result.stdout + result.stderr

@@ -20,6 +20,7 @@ choices: gap.key -> gap.candidates[n].value（JSON token），或只含 path/cod
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
@@ -32,6 +33,7 @@ from sqlalchemy import text
 
 from .catalog import build_catalog, entries, material_groups, number, path_label
 from .storage import PREVIEW_TYPE, StorageError, freeze_preview
+from .sql_dialect import is_mssql, limited_select
 
 
 # engine/pricing.py 的既有白名單；避免 import 該模組而載入 config/repository。
@@ -46,9 +48,27 @@ class MasterSource:
         self.db = db
         self.allow_code_variants = allow_code_variants
 
+    def _master_row(self, row):
+        # MSSQL ERP 主檔的 CHAR/NCHAR 會傳回補齊空白。只正規化主檔字串
+        # 尾端 ASCII space，不碰前綴／內部空白、工單原文或歷史保存內容。
+        return {k: v.rstrip(" ") if is_mssql(self.db) and isinstance(v, str) else v
+                for k, v in row.items()}
+
+    @contextmanager
+    def _read(self):
+        try:
+            with self.db.read() as conn:
+                yield conn
+        except StorageError:
+            raise
+        except Exception:
+            if is_mssql(self.db):
+                raise StorageError("MSSQL 主檔查詢未完成；請確認結構與讀取權限後重試") from None
+            raise
+
     def categories(self):
-        with self.db.read() as conn:
-            return [dict(r) for r in conn.execute(text(
+        with self._read() as conn:
+            return [self._master_row(r) for r in conn.execute(text(
                 "SELECT prodkind, codsc, quo_rate FROM invdoc "
                 "WHERE workgroup=:wg AND ordkind='1' ORDER BY prodkind"
             ), {"wg": self.db.workgroup}).mappings().all()]
@@ -63,24 +83,25 @@ class MasterSource:
             "ordspe": "workgroup,path,code,codsc,compri",
             "ordqty": "workgroup,path,code,part_path,stdqty,stdpar",
         }
-        with self.db.read() as conn:
+        with self._read() as conn:
             categories = conn.execute(text(
                 "SELECT prodkind,codsc,quo_rate FROM invdoc "
                 "WHERE workgroup=:wg AND ordkind='1' AND prodkind=:category"
             ), {"wg": self.db.workgroup, "category": category_code}).mappings().all()
             if len(categories) != 1:
-                raise ValueError("所選產品類別不存在或不唯一")
+                raise StorageError("所選產品類別不存在或不唯一")
             tables = {}
             for table, fields in columns.items():
                 path_column = "pathc" if table == "ordstr" else "path"
-                prefix_filter = "" if table == "ordspd" else f" AND substr({path_column},1,:size)=:prefix"
-                rows = conn.execute(text(
-                    f"SELECT {fields} FROM {table} WHERE workgroup=:wg{prefix_filter} LIMIT 20001"
-                ), {"wg": self.db.workgroup, "prefix": category_code + "\\", "size": len(category_code) + 1}).mappings().all()
+                substring = "SUBSTRING" if is_mssql(self.db) else "substr"
+                prefix_filter = "" if table == "ordspd" else f" AND {substring}({path_column},1,:size)=:prefix"
+                rows = conn.execute(text(limited_select(
+                    self.db, fields, f"{table} WHERE workgroup=:wg{prefix_filter}", 20001
+                )), {"wg": self.db.workgroup, "prefix": category_code + "\\", "size": len(category_code) + 1}).mappings().all()
                 if len(rows) > 20000:
-                    raise ValueError("所選主檔超過單次讀取上限；不能以截斷資料報價")
-                tables[table] = [dict(r) for r in rows]
-        return build_catalog(self.db.workgroup, dict(categories[0]), tables,
+                    raise StorageError("所選主檔超過單次讀取上限；不能以截斷資料報價")
+                tables[table] = [self._master_row(r) for r in rows]
+        return build_catalog(self.db.workgroup, self._master_row(categories[0]), tables,
                              allow_code_variants=self.allow_code_variants)
 
 

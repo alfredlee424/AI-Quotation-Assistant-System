@@ -18,6 +18,18 @@ def clean_environment():
     return env
 
 
+def startup_error(exc):
+    """僅格式化此後端主動產生的安全錯誤，不輸出 DBAPI 例外。"""
+    from local_quote.backend import ConnectionSettingsError, SchemaError, SettingsError
+    if isinstance(exc, SchemaError):
+        return "既有資料表不相容：" + str(exc) + "；請交由資料庫管理員核對既有七表，不會自動建表。"
+    if isinstance(exc, ConnectionSettingsError):
+        return "資料庫連線失敗：" + str(exc)
+    if isinstance(exc, SettingsError):
+        return "設定或驅動檢查未通過：" + str(exc)
+    return "請檢查已安裝的專案套件、本機連線、工作組及既有七表結構；不會自動建表。"
+
+
 def launch(*, worker=False):
     if not worker:
         # 不退回 PATH 或全域 Python，避免使用未安裝專案依賴的環境。
@@ -54,9 +66,13 @@ def launch(*, worker=False):
             database.inspect_schema()
         finally:
             database.engine.dispose()
-    except Exception:
+    except Exception as exc:
         # 不輸出 driver exception（可能包含連線、SQL 或參數）。
-        print("本機模式拒絕啟動：請檢查本機連線、工作組及既有七表結構；不會自動建表。", file=sys.stderr)
+        try:
+            message = startup_error(exc)
+        except ImportError:
+            message = "無法載入資料庫套件；請用專案 Python 安裝 requirements.txt。"
+        print("本機模式拒絕啟動：" + message, file=sys.stderr)
         return 2
     with TemporaryDirectory(prefix="local-quote-ui-") as directory:
         # 不讀專案或使用者 Streamlit 設定，也不把客戶內容落到暫存目錄。

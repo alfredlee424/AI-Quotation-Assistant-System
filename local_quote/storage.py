@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import bindparam, text
 
 from .backend import LocalDatabase, SchemaError
+from .sql_dialect import (insert_statement, is_mssql, limited_select, lock_suffix,
+                          lock_table, numeric_column)
 
 
 PREVIEW_TYPE = "local-master-four-quote"
@@ -265,6 +267,59 @@ def _mysql_lock(conn):
             conn.rollback()
 
 
+MSSQL_LOCK_RESOURCE = "local-quote-number-all-stores-v1"
+
+
+@contextmanager
+def _mssql_lock(conn):
+    """Database/public scoped session lock, shared by both stores and all groups."""
+    acquired = False
+    try:
+        try:
+            result = conn.execute(text(
+                "DECLARE @result int; EXEC @result=sys.sp_getapplock "
+                "@Resource=:resource, @LockMode='Exclusive', @LockOwner='Session', "
+                "@LockTimeout=5000, @DbPrincipal='public'; SELECT @result"
+            ), {"resource": MSSQL_LOCK_RESOURCE}).scalar_one()
+        except BaseException as exc:
+            conn.invalidate()  # Server may have acquired it before transport failed.
+            if not isinstance(exc, Exception):
+                raise
+            raise StorageError("無法確認配號鎖狀態，連線已失效") from None
+        if type(result) is not int or result < 0:
+            if type(result) is int and result == -1:
+                raise LockTimeout("無法在 5 秒內取得配號鎖")
+            if type(result) is not int or result not in (-2, -3, -999):
+                conn.invalidate()
+            raise StorageError("MSSQL 配號鎖取得失敗")
+        acquired = True
+        try:
+            conn.rollback()  # End autobegin; session lock survives rollback.
+        except BaseException as exc:
+            conn.invalidate()  # Unknown transaction state must never return to pool.
+            if not isinstance(exc, Exception):
+                raise
+            raise StorageError("配號鎖交易狀態不明，連線已失效") from None
+        yield
+    finally:
+        if not conn.invalidated:
+            try:
+                conn.rollback()  # Always end writes before releasing the session lock.
+                if acquired:
+                    released = conn.execute(text(
+                        "DECLARE @result int; EXEC @result=sys.sp_releaseapplock "
+                        "@Resource=:resource, @LockOwner='Session', @DbPrincipal='public'; SELECT @result"
+                    ), {"resource": MSSQL_LOCK_RESOURCE}).scalar_one()
+                    if type(released) is not int or released < 0:
+                        raise StorageError("無法確認 MSSQL 配號鎖已釋放")
+                    conn.rollback()
+            except BaseException as exc:
+                conn.invalidate()
+                if not isinstance(exc, Exception):
+                    raise
+                raise StorageError("配號鎖清理未完成，連線已失效；請以原固定內容重試查核") from None
+
+
 @contextmanager
 def _sqlite_lock(engine):
     # Only an explicit isolated testing engine reaches this branch.
@@ -341,7 +396,8 @@ class BatchStore:
         _require(preview["workgroup"] == self.db.workgroup, "工作組不符")
         try:
             with self.db.engine.connect() as conn:
-                lock = _sqlite_lock(self.db.engine) if self.db.testing else _mysql_lock(conn)
+                lock = (_mssql_lock(conn) if is_mssql(self.db) else
+                        _sqlite_lock(self.db.engine) if self.db.testing else _mysql_lock(conn))
                 with lock:
                     with conn.begin():
                         self.db.inspect_schema(conn)
@@ -350,6 +406,7 @@ class BatchStore:
                         if existing:
                             result, old = _decode_history(existing, preview["preview_id"], self.db.workgroup)
                             _require(old == frozen, "相同批次 ID 已保存不同內容")
+                            self._verify_items(conn, result["children"])
                             return result
                         refs = self._allocate_refs(conn)
                         confirmed_at = _now().isoformat()
@@ -358,13 +415,24 @@ class BatchStore:
                         payloads = [_canonical(d) for d in documents]
                         _require(all(len(p.encode("utf-8")) <= TEXT_BYTES for p in payloads),
                                  "單張快照超過 TEXT 65535 UTF-8 bytes，拒絕保存")
-                        for doc, payload in zip(documents, payloads):
-                            conn.execute(text(
-                                "INSERT INTO quote_snapshot_document (workgroup,preview_id,ref_no,payload) "
-                                "VALUES (:workgroup,:preview_id,:ref_no,:payload)"),
-                                {"workgroup": self.db.workgroup, "preview_id": doc["preview_id"],
-                                 "ref_no": doc["ref_no"], "payload": payload})
+                        headers = [{"workgroup": self.db.workgroup, "preview_id": doc["preview_id"],
+                                    "ref_no": doc["ref_no"], "payload": payload}
+                                   for doc, payload in zip(documents, payloads)]
+                        if is_mssql(self.db):
+                            for doc, header in zip(documents, headers):
+                                self.db.validate_write_values("quote_snapshot_document", header)
+                                for row in self._item_rows(doc):
+                                    self.db.validate_write_values("ordqdt_ai", row)
+                        for doc, header in zip(documents, headers):
+                            conn.execute(insert_statement(self.db, "quote_snapshot_document", header), header)
                             self._insert_items(conn, doc)
+                        if is_mssql(self.db):
+                            verified, old = _decode_history(
+                                _select_documents(conn, self.db.workgroup, ids),
+                                preview["preview_id"], self.db.workgroup)
+                            _require(old == frozen and verified["children"] == documents,
+                                     "保存讀回的完整快照不符")
+                            self._verify_items(conn, documents)
                         return {"batch_id": preview["preview_id"], "ref_nos": refs,
                                 "confirmed_at": confirmed_at, "children": documents}
         except (StorageError, SchemaError):
@@ -384,8 +452,9 @@ class BatchStore:
                 for table in ("ordqdt_ai", "quote_snapshot_document"):
                     # Global, not workgroup-scoped, collision check. Locking reads see
                     # external commits even at MySQL REPEATABLE READ isolation.
-                    suffix = "" if self.db.testing else " FOR UPDATE"
-                    stmt = text(f"SELECT ref_no FROM {table} WHERE ref_no IN :refs LIMIT 1{suffix}")
+                    stmt = text(limited_select(self.db, "ref_no",
+                                lock_table(self.db, table) + " WHERE ref_no IN :refs", 1)
+                                + lock_suffix(self.db))
                     stmt = stmt.bindparams(bindparam("refs", expanding=True))
                     if conn.execute(stmt, {"refs": refs}).first() is not None:
                         collision = True
@@ -411,7 +480,7 @@ class BatchStore:
         return documents
 
     @staticmethod
-    def _insert_items(conn, doc):
+    def _item_rows(doc):
         rows = []
         for seq, item in enumerate(doc["child"]["calc"]["items"], 1):
             rows.append({
@@ -423,11 +492,28 @@ class BatchStore:
                    ("qty", "stdqty", "stdpar", "compri", "unit_price", "amount")},
                 "unit": "", "status": "C", "transferred": "N",
                 "adddate": doc["confirmed_at"][:10], "addusrno": "", "prgno": "LOCAL4",
+                "abndat": None, "abntim": None, "usrno": None,
             })
-        names = tuple(rows[0])
-        stmt = text("INSERT INTO ordqdt_ai (" + ",".join(names) + ") VALUES ("
-                    + ",".join(":" + k for k in names) + ")")
-        conn.execute(stmt, rows)
+        return rows
+
+    def _insert_items(self, conn, doc):
+        rows = self._item_rows(doc)
+        conn.execute(insert_statement(self.db, "ordqdt_ai", rows[0]), rows)
+
+    def _verify_items(self, conn, documents):
+        if not is_mssql(self.db):
+            return  # Preserve legacy MySQL/SQLite history policy.
+        numeric = {"qty", "stdqty", "stdpar", "compri", "unit_price", "amount"}
+        for doc in documents:
+            expected = self._item_rows(doc)
+            columns = ",".join((numeric_column(self.db, k) if k in numeric else k) +
+                               " AS " + k for k in expected[0])
+            actual = conn.execute(text(f"SELECT {columns} FROM ordqdt_ai "
+                                  "WHERE workgroup=:wg AND ref_no=:ref ORDER BY seq_no"),
+                                  {"wg": self.db.workgroup, "ref": doc["ref_no"]}).mappings().all()
+            # V1 has no numeric profile: do not silently introduce a binary32 projection.
+            _require([dict(row) for row in actual] == expected,
+                     "歷史快照與 ordqdt_ai 明細不符；拒絕有損保存")
 
     def read(self, batch_id: str):
         """Snapshot-only read; never inspect or query master/pricing tables."""
@@ -437,7 +523,9 @@ class BatchStore:
                 rows = _select_documents(conn, self.db.workgroup, _child_ids(batch_id))
                 if not rows:
                     return None
-                return _decode_history(rows, batch_id, self.db.workgroup)[0]
+                result = _decode_history(rows, batch_id, self.db.workgroup)[0]
+                self._verify_items(conn, result["children"])
+                return result
         except StorageError:
             raise
         except Exception:
@@ -452,9 +540,8 @@ class BatchStore:
                 result, seen = [], set()
                 while len(result) < limit:
                     where = "workgroup=:wg" + (" AND ref_no < :cursor" if cursor else "")
-                    rows = conn.execute(text(
-                        "SELECT preview_id, ref_no, payload FROM quote_snapshot_document WHERE "
-                        + where + " ORDER BY ref_no DESC LIMIT 100"),
+                    rows = conn.execute(text(limited_select(self.db, "preview_id, ref_no, payload",
+                        "quote_snapshot_document WHERE " + where + " ORDER BY ref_no DESC", 100)),
                         {"wg": self.db.workgroup, "cursor": cursor}).mappings().all()
                     if not rows:
                         break
@@ -473,6 +560,7 @@ class BatchStore:
                         history, _ = _decode_history(
                             _select_documents(conn, self.db.workgroup, _child_ids(batch_id)),
                             batch_id, self.db.workgroup)
+                        self._verify_items(conn, history["children"])
                         result.append({"batch_id": batch_id, "ref_nos": history["ref_nos"]})
                         if len(result) == limit:
                             break
