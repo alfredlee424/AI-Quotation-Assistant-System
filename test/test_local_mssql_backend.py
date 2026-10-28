@@ -439,6 +439,45 @@ def test_connection_sqlstate_diagnostics_never_echo_raw_error(state, fragment):
     assert "secret-canary" not in startup_error(RuntimeError("secret-canary"))
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("native,fragment", [
+    ("-2146893019", "TLS 憑證鏈不受信任"),
+    ("-2146893022", "TLS 憑證名稱與連線目標不符"),
+])
+def test_tls_native_diagnostics_are_safe_and_do_not_retry(wrapped, native, fragment):
+    from sqlalchemy.exc import OperationalError
+    from local_quote.bootstrap import startup_error
+    original = RuntimeError("08001", f"secret-canary 憑證 certificate ({native}) (SQLDriverConnect)")
+    error = OperationalError("secret-canary SQL", {"password": "secret-canary"}, original) if wrapped else original
+    db = mssql_db()
+    db.engine.connect.side_effect = error
+    with pytest.raises(backend.ConnectionSettingsError) as caught:
+        with db.read():
+            pytest.fail("must not yield a failed connection")
+    message = startup_error(caught.value)
+    assert fragment in message and "SQLSTATE 08001" in message
+    assert "secret-canary" not in message
+    assert caught.value.__suppress_context__
+    db.engine.connect.assert_called_once_with()
+
+
+@pytest.mark.parametrize("detail", [
+    "secret-canary (53)", "secret-canary (-21468930190)",
+    "secret-canary -2146893019", "secret-canary certificate 憑證", None,
+])
+def test_unknown_08001_does_not_claim_certificate_failure(detail):
+    message = str(backend._connection_error(RuntimeError("08001", detail)))
+    assert "僅此錯誤碼無法判定" in message
+    assert "Encrypt=yes" in message and "TrustServerCertificate=no" in message
+    assert "secret-canary" not in message
+
+
+def test_tls_native_code_does_not_override_other_sqlstates():
+    message = str(backend._connection_error(RuntimeError("28000", "secret-canary (-2146893019)")))
+    assert "登入失敗" in message and "TLS" not in message
+    assert "secret-canary" not in message
+
+
 @pytest.fixture
 def read_db():
     # Real SQLAlchemy events/transactions; only MSSQL isolation/context protocol is faked.

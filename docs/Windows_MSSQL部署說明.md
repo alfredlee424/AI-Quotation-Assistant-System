@@ -50,6 +50,30 @@
 
 ## 5. 錯誤排除與現場驗收
 
+### 一般主程式可連線，但本機模式顯示連線失敗
+
+兩個入口的連線政策不同，不代表資料庫服務一定停止：
+
+| 比較 | 一般 [app.py](../app.py) | [本機模式](../local_quote/backend.py) |
+|---|---|---|
+| 設定來源 | 環境變數優先於設定檔；缺連線設定時可回退 SQLite | 只讀專案根目錄 [`.env`](../.env)，不插值、不回退 |
+| MSSQL 加密 | 直接交由原連線字串與 ODBC 預設決定 | 強制加密，預設驗證憑證 |
+| 初始化 | 啟動會走初始化流程 | 只檢查既有結構，不建表、不灌資料 |
+
+因此 ODBC 17 原本未要求加密、而 SQL Server 使用自簽憑證時，可能只有本機模式失敗。一般主程式顯示「資料已存在、略過灌入」僅證明它查到資料，**不能證明兩個入口連到同一資料庫**。
+
+依序處理：
+
+1. 在現場確認一般主程式實際使用的資料庫種類、主機、執行個體、資料庫與帳號，是否與專案 [`.env`](../.env) 一致；檢查 PowerShell／系統是否另設連線環境變數。不要將完整連線或密碼貼到回報中。
+2. 若為同一台本機 SQL Server，優先配置可信憑證。**若確認使用本機自簽憑證且接受不驗證身份的風險**，可在既有 [DB_CONN_STR](../local_quote/backend.py:132) 的查詢參數尾端加入 [&TrustServerCertificate=yes](../local_quote/backend.py:84)。既有參數若為 no，改成 yes，不要重複加入；保留原帳密、主機、資料庫及驅動，不必換成 localhost。不要設定 [Encrypt=no](../local_quote/backend.py:84)，本機模式不允許關閉加密。
+3. 停止舊服務後，以 [專案 Python 啟動本機模式](../four_quote_acceptance.py:15)：[.\venv\Scripts\python.exe .\four_quote_acceptance.py --local-db](../four_quote_acceptance.py:15)。這是部署端設定變更，本次程式更新不會自動修改現場設定或信任憑證。
+4. 若仍是 SQLSTATE 08001，檢查執行個體、實際連接埠、SQL Server TCP/IP 與服務狀態；具名執行個體另核對 SQL Server Browser。**08001 不是憑證專用錯誤碼**，信任憑證不能修復主機／連接埠錯誤。
+5. 若訊息轉成「既有資料表不相容」，代表已越過連線階段，依第 3 節由 DBA 處理既有七表及權限；不要加初始化選項。
+
+[安全錯誤分類](../local_quote/backend.py:27)會將 Windows ODBC 已知的憑證鏈不受信任／名稱不符原生碼轉成固定中文訊息；未辨識的 08001 保留一般排除提示。不輸出原始 ODBC 錯誤、SQL、帳密或主機資訊，也不自動降低 TLS 政策。此辨識不涵蓋所有 ODBC／TLS 錯誤。
+
+### 其他錯誤與驗收
+
 | 訊息類型 | 核對方向 |
 |---|---|
 | 找不到專案 Python | 在本台電腦重建虛擬環境，不沿用 macOS 環境 |
@@ -72,3 +96,5 @@
 2026-10-21 最終回歸：[PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./venv/bin/python -m pytest test/test_local_*.py test/test_acceptance_bootstrap.py -q -p no:cacheprovider](../test/test_local_mssql_storage.py:1)，**503 項及 274 個子測試通過（52.15 秒）**；包括全部本機系列與隔離啟動測試，差異空白檢查亦通過。
 
 本批在 macOS 執行離線測試，不讀私人設定、不連正式庫。**尚未在真實 Windows／SQL Server／ODBC 17 或 18 完成連線、併發或保存驗收，也未重跑全專案所有測試。** 上述數字不作為現場主檔、權限或正式保存已通過的證明。
+
+2026-10-28 連線診斷回歸：沿用上述離線測試命令，**515 項及 274 個子測試通過（52.24 秒）**。新增涵蓋原始／SQLAlchemy 包裝的憑證錯誤、不明 08001 不誤判、秘密遮蔽與啟動失敗清理；未在部署端 Windows／SQL Server 驗證，不表示現場連線已恢復。

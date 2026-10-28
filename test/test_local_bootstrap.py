@@ -119,6 +119,8 @@ assert len(seen) == 1 and not seen[0].exists()
     ("schema", "既有資料表不相容"),
     ("driver", "ODBC"),
     ("login", "登入失敗"),
+    ("connection", "SQLSTATE 08001"),
+    ("certificate", "TLS 憑證鏈不受信任"),
     ("unknown", "請檢查已安裝的專案套件"),
 ])
 def test_worker_startup_diagnostics_disposes_engine_and_never_echoes_driver(kind, expected):
@@ -136,6 +138,8 @@ errors = {
     "schema": backend.SchemaError("ordqdt_ai: missing table"),
     "driver": backend._connection_error(RuntimeError("IM002", "secret-canary")),
     "login": backend._connection_error(RuntimeError("28000", "secret-canary")),
+    "connection": backend._connection_error(RuntimeError("08001", "secret-canary")),
+    "certificate": backend._connection_error(RuntimeError("08001", "secret-canary (-2146893019)")),
     "unknown": RuntimeError("secret-canary-server-password-query"),
 }
 disposed = []

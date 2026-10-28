@@ -25,15 +25,31 @@ class ConnectionSettingsError(SettingsError):
 
 
 def _connection_error(exc):
-    # 僅使用 SQLSTATE 分類，不顯示原始 driver 訊息、SQL、參數或連線字串。
+    # 只輸出固定白名單訊息；不顯示原始 driver 訊息、SQL、參數或連線字串。
     original = getattr(exc, "orig", exc)
     args = getattr(original, "args", ())
     state = args[0] if args and isinstance(args[0], str) else ""
+    if state == "08001":
+        # Windows ODBC 將 Schannel 原生碼放在括號內；不依賴作業系統語言。
+        # 08001 也可能是網路／執行個體問題，沒有已知原生碼時不可斷言是 TLS。
+        codes = {code for arg in args[1:] if isinstance(arg, str)
+                 for code in re.findall(r"\((-?\d+)\)", arg)}
+        tls_messages = {
+            "-2146893019": "TLS 憑證鏈不受信任；請配置可信任的 SQL Server 憑證。"
+                "只有確認為本機 SQL Server 且接受不驗證伺服器身份的風險時，"
+                "才在 .env 的 DB_CONN_STR 明確設定 TrustServerCertificate=yes；傳輸仍維持加密。",
+            "-2146893022": "TLS 憑證名稱與連線目標不符；請核對本機主機名稱與 SQL Server 憑證名稱。",
+        }
+        for code, message in tls_messages.items():
+            if code in codes:
+                return ConnectionSettingsError("[SQLSTATE 08001] " + message)
     messages = {
         "IM002": "找不到指定 ODBC 驅動；請安裝與 Python 位元相符的 Microsoft ODBC Driver 17／18。",
         "IM003": "無法載入 ODBC 驅動；請檢查安裝及 Python／ODBC 位元版本。",
         "28000": "資料庫登入失敗；請確認 SQL Server 帳密、混合驗證模式及資料庫存取權限。",
-        "08001": "無法建立資料庫連線；請檢查本機 SQL Server 服務、執行個體／連接埠及 TLS 憑證設定。",
+        "08001": "[SQLSTATE 08001] 無法建立資料庫連線；請檢查本機 SQL Server 服務、執行個體／連接埠及 TLS 憑證設定。"
+            "本機模式強制 Encrypt=yes，預設 TrustServerCertificate=no，與一般 app.py 不同；"
+            "僅此錯誤碼無法判定是否為憑證問題。請參閱 docs/Windows_MSSQL部署說明.md。",
         "HYT00": "資料庫連線逾時；請檢查本機服務及執行個體／連接埠。",
         "HYT01": "資料庫連線逾時；請檢查本機服務及執行個體／連接埠。",
     }
