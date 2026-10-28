@@ -222,6 +222,50 @@ def test_catalog_positive_normalization_and_query_scopes():
     assert not any("is_disabled=0" in sql for sql in conn.queries)
 
 
+@pytest.mark.parametrize("catalog,stage", [
+    ("tables", "資料表"), ("columns", "欄位"), ("indexes", "索引"),
+    ("foreign_keys", "外鍵"), ("triggers", "觸發器"),
+    ("check_constraints", "檢查約束"), ("security_predicates", "列級安全政策"),
+])
+def test_metadata_failure_identifies_stage_without_echoing_driver(catalog, stage):
+    from sqlalchemy.exc import ProgrammingError
+    conn = CatalogConnection()
+    execute = conn.execute
+    def fail(statement):
+        sql = str(statement)
+        # Every query joins sys.tables; select its standalone query only.
+        target = "sys." + catalog + " " in sql
+        if catalog == "tables":
+            target = "t.temporal_type" in sql
+        if target:
+            raise ProgrammingError("secret-canary SQL", {"p": "secret-canary"},
+                                   RuntimeError("42S22", "secret-canary (207) (SQLExecDirectW)"))
+        return execute(statement)
+    with patch.object(conn, "execute", side_effect=fail), pytest.raises(SchemaError) as caught:
+        LocalDatabase._mssql_schema(conn)
+    message = str(caught.value)
+    assert "階段：" + stage in message and "錯誤 207" in message and "2016" in message
+    assert "secret-canary" not in message and caught.value.__suppress_context__
+
+
+@pytest.mark.parametrize("error,fragment", [
+    (RuntimeError("42000", "secret-canary (229)"), "權限遭拒"),
+    (RuntimeError("42S02", "secret-canary (208)"), "不代表業務七表缺表"),
+    (RuntimeError("42000", "secret-canary (102)"), "語法不相容"),
+    (RuntimeError("42000", "secret-canary (156)"), "語法不相容"),
+    (RuntimeError("HYT00", "secret-canary"), "逾時"),
+    (RuntimeError("HYT01", "secret-canary"), "逾時"),
+    (RuntimeError("08S01", "secret-canary"), "連線中斷"),
+    (RuntimeError("42000", "secret-canary (2070)"), "遭伺服器拒絕"),
+    (RuntimeError("secret-canary", "secret-canary (207)"), "未分類"),
+    (KeyError("secret-canary"), "結構資訊處理失敗"),
+    (RuntimeError(), "未分類"),
+])
+def test_metadata_error_categories_are_fixed_and_secret_free(error, fragment):
+    message = mssql_schema._metadata_failure(error)
+    assert fragment in message and "secret-canary" not in message
+
+
 @pytest.mark.parametrize("default_schema,permission", [("private_fixture", 1), ("dbo", 0), ("dbo", None), (None, 1)])
 def test_effective_schema_and_database_metadata_permission_fail_closed(default_schema, permission):
     conn = CatalogConnection(default_schema=default_schema, can_view=permission)

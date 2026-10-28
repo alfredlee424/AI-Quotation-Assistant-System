@@ -7,6 +7,8 @@ inspect_schema 都驗證此條件，讓既有未限定 schema 的查詢不會解
 """
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import text
 
 from .backend import PRIMARY_KEYS, REQUIRED_COLUMNS, WRITE_TABLES, SchemaError
@@ -31,6 +33,33 @@ def check_context(conn):
         raise SchemaError("MSSQL 必須使用 dbo 預設結構並具資料庫 VIEW DEFINITION 權限") from None
 
 
+def _metadata_failure(exc):
+    """只回傳固定分類，不顯示 driver 原文、物件名稱或查詢參數。"""
+    original = getattr(exc, "orig", exc)
+    args = getattr(original, "args", ())
+    state = args[0] if args and isinstance(args[0], str) else ""
+    codes = {code for arg in args[1:] if isinstance(arg, str)
+             for code in re.findall(r"\((\d+)\)", arg)}
+    if state in {"42000", "42S22", "42S02"}:
+        for code, reason in (
+            ("207", "SQL Server 錯誤 207：結構查詢參照了不存在的系統欄位；請核對 SQL Server 是否為 2016 以上及查詢相容性"),
+            ("208", "SQL Server 錯誤 208：結構查詢參照的系統物件不可用；請核對伺服器版本與查詢相容性，不代表業務七表缺表"),
+            ("229", "SQL Server 錯誤 229：系統結構查詢權限遭拒；請由 DBA 核對該帳號的有效權限"),
+            ("102", "SQL Server 錯誤 102：結構查詢語法不相容；請核對伺服器版本與程式查詢"),
+            ("156", "SQL Server 錯誤 156：結構查詢語法不相容；請核對伺服器版本與程式查詢"),
+        ):
+            if code in codes:
+                return reason
+        return "結構查詢遭伺服器拒絕；請核對伺服器版本、查詢相容性與有效權限"
+    if state in {"HYT00", "HYT01"}:
+        return "結構查詢逾時；請核對伺服器負載與鎖定情形"
+    if state in {"08001", "08003", "08007", "08S01"}:
+        return "讀取結構時資料庫連線中斷；請核對服務與連線狀態"
+    if isinstance(original, (KeyError, TypeError, ValueError, AttributeError)):
+        return "結構資訊處理失敗；請核對程式與驅動相容性或唯讀查詢限制"
+    return "未分類的結構讀取錯誤；請核對伺服器版本、驅動與查詢相容性"
+
+
 def inspect_schema(conn):
     """僅 SELECT，正規化七表、雙向 FK、trigger 與 schema 副作用 facts。"""
     check_context(conn)
@@ -38,6 +67,7 @@ def inspect_schema(conn):
     def rows(sql):
         return conn.execute(text(sql)).mappings().all()
 
+    stage = "資料表"
     try:
         tables = rows(
             "SELECT t.name AS table_name, t.temporal_type, t.is_memory_optimized, "
@@ -52,6 +82,7 @@ def inspect_schema(conn):
                                    table_risk=any(row[k] for k in (
                                        "temporal_type", "is_memory_optimized", "is_filetable", "is_tracked_by_cdc",
                                        "is_replicated", "is_merge_published", "is_sync_tran_subscribed")))
+        stage = "欄位"
         for row in rows(
             "SELECT t.name AS table_name, c.name AS column_name, ty.name AS type_name, "
             "ty.is_user_defined, c.max_length, c.precision, c.is_nullable, "
@@ -75,6 +106,7 @@ def inspect_schema(conn):
                 special=bool(row["is_user_defined"] or row["is_filestream"] or
                              row["is_sparse"] or row["is_column_set"] or
                              row["encryption_type"] or row["rule_object_id"]))
+        stage = "索引"
         indexes = {}
         for row in rows(
             "SELECT t.name AS table_name, i.index_id, i.type AS index_type, "
@@ -102,24 +134,26 @@ def inspect_schema(conn):
                 if index["unique"]:
                     facts[table]["unique"].append(index["columns"])
         # Disabled / untrusted FK 與 trigger 也不忽略；啟用狀態不代表不存在風險。
+        stage = "外鍵"
         for row in rows(
             "SELECT t.name AS table_name" + _JOIN +
             "JOIN sys.foreign_keys f ON f.parent_object_id=t.object_id "
             "OR f.referenced_object_id=t.object_id WHERE " + _SCOPE):
             if row["table_name"] in facts:
                 facts[row["table_name"]]["fk"].append(True)
-        for catalog, join, key in (
-            ("sys.triggers", "x.parent_id=t.object_id", "triggers"),
-            ("sys.check_constraints", "x.parent_object_id=t.object_id", "checks"),
-            ("sys.security_predicates", "x.target_object_id=t.object_id", "security"),
+        for catalog, join, key, stage in (
+            ("sys.triggers", "x.parent_id=t.object_id", "triggers", "觸發器"),
+            ("sys.check_constraints", "x.parent_object_id=t.object_id", "checks", "檢查約束"),
+            ("sys.security_predicates", "x.target_object_id=t.object_id", "security", "列級安全政策"),
         ):
             for row in rows("SELECT t.name AS table_name" + _JOIN +
                             "JOIN " + catalog + " x ON " + join + " WHERE " + _SCOPE):
                 if row["table_name"] in facts:
                     facts[row["table_name"]][key].append(True)
         return facts
-    except Exception:
-        raise SchemaError("MSSQL 無法取得完整七表結構資訊") from None
+    except Exception as exc:
+        raise SchemaError("MSSQL 無法取得完整七表結構資訊（階段：" + stage + "）；"
+                          + _metadata_failure(exc)) from None
 
 
 def _float_profile(col):
