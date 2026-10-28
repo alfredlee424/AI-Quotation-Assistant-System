@@ -196,6 +196,11 @@ class CatalogConnection:
         assert "t.name IN (" in sql
         for name in ("indexes", "columns", "foreign_keys", "triggers", "check_constraints", "security_predicates", "tables"):
             if "sys." + name + " " in sql:
+                if name == "columns" and "CONVERT(int, COLLATIONPROPERTY(c.collation_name, 'CodePage')) AS codepage" not in sql:
+                    # 模擬 pyodbc 不支援 sql_variant 的 fetch 錯誤及其反向 args。
+                    result.mappings.return_value.all.side_effect = RuntimeError(
+                        "ODBC SQL type -150 is not yet supported. secret-canary", "HY106")
+                    return result
                 result.mappings.return_value.all.return_value = self.rows[name]
                 return result
         raise AssertionError("unexpected SQL")
@@ -264,6 +269,33 @@ def test_metadata_failure_identifies_stage_without_echoing_driver(catalog, stage
 def test_metadata_error_categories_are_fixed_and_secret_free(error, fragment):
     message = mssql_schema._metadata_failure(error)
     assert fragment in message and "secret-canary" not in message
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_metadata_unsupported_type_sqlstate_in_either_position(wrapped, reverse):
+    from sqlalchemy.exc import NotSupportedError
+    args = ("HY106", "ODBC SQL type -150 is not yet supported. secret-canary")
+    original = RuntimeError(*(args[::-1] if reverse else args))
+    error = NotSupportedError("secret-canary SQL", {"p": "secret-canary"}, original) if wrapped else original
+    message = mssql_schema._metadata_failure(error)
+    assert "HY106" in message and "回傳型別" in message
+    assert "secret-canary" not in message
+
+
+def test_uncast_variant_fixture_reproduces_safe_column_failure():
+    conn = CatalogConnection()
+    execute = conn.execute
+    def remove_cast(statement):
+        sql = str(statement).replace(
+            "CONVERT(int, COLLATIONPROPERTY(c.collation_name, 'CodePage'))",
+            "COLLATIONPROPERTY(c.collation_name, 'CodePage')")
+        return execute(text(sql))
+    with patch.object(conn, "execute", side_effect=remove_cast), pytest.raises(SchemaError) as caught:
+        LocalDatabase._mssql_schema(conn)
+    message = str(caught.value)
+    assert "階段：欄位" in message and "HY106" in message
+    assert "secret-canary" not in message
 
 
 @pytest.mark.parametrize("default_schema,permission", [("private_fixture", 1), ("dbo", 0), ("dbo", None), (None, 1)])

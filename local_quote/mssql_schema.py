@@ -37,8 +37,12 @@ def _metadata_failure(exc):
     """只回傳固定分類，不顯示 driver 原文、物件名稱或查詢參數。"""
     original = getattr(exc, "orig", exc)
     args = getattr(original, "args", ())
-    state = args[0] if args and isinstance(args[0], str) else ""
-    codes = {code for arg in args[1:] if isinstance(arg, str)
+    # pyodbc 的型別轉換錯誤可能是 (message, SQLSTATE)，而非 (SQLSTATE, message)。
+    # 只辨識完整且已知的代碼，不輸出或猜測 driver 原文。
+    states = {"42000", "42S22", "42S02", "HYT00", "HYT01", "HY106",
+              "08001", "08003", "08007", "08S01"}
+    state = next((arg for arg in args if isinstance(arg, str) and arg in states), "")
+    codes = {code for arg in args if isinstance(arg, str)
              for code in re.findall(r"\((\d+)\)", arg)}
     if state in {"42000", "42S22", "42S02"}:
         for code, reason in (
@@ -53,6 +57,8 @@ def _metadata_failure(exc):
         return "結構查詢遭伺服器拒絕；請核對伺服器版本、查詢相容性與有效權限"
     if state in {"HYT00", "HYT01"}:
         return "結構查詢逾時；請核對伺服器負載與鎖定情形"
+    if state == "HY106":
+        return "ODBC 不支援結構查詢的回傳型別（HY106）；請更新結構查詢程式，確認 SQL 變體型別已明確轉型"
     if state in {"08001", "08003", "08007", "08S01"}:
         return "讀取結構時資料庫連線中斷；請核對服務與連線狀態"
     if isinstance(original, (KeyError, TypeError, ValueError, AttributeError)):
@@ -89,7 +95,9 @@ def inspect_schema(conn):
             "c.is_identity, c.is_computed, c.generated_always_type, c.is_hidden, "
             "c.is_filestream, c.is_sparse, c.is_column_set, c.encryption_type, "
             "c.default_object_id, c.rule_object_id, "
-            "COLLATIONPROPERTY(c.collation_name, 'CodePage') AS codepage" + _JOIN +
+            # COLLATIONPROPERTY 回傳 sql_variant；pyodbc 可能以 HY106 拒絕讀取。
+            # codepage 本來就是整數；保留 NULL，不能以預設編碼掩蓋未知值。
+            "CONVERT(int, COLLATIONPROPERTY(c.collation_name, 'CodePage')) AS codepage" + _JOIN +
             "JOIN sys.columns c ON c.object_id=t.object_id "
             "JOIN sys.types ty ON ty.user_type_id=c.user_type_id WHERE " + _SCOPE):
             if row["table_name"] not in facts:
