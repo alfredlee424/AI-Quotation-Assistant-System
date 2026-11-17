@@ -22,6 +22,9 @@ send(text) -> 助理回覆；同時記入 messages。quote() -> 報價單檢視�
 5. save(store, actor=...)：全部完整後逐項保存，每個項目各自一個單號（DynamicStore，DQ 單號，
    寫入 ordqdt_ai 與 quote_snapshot_document）。任一項保存後即鎖定，須「重新開始」才能建立新報價。
 
+6. log_dir 有給時，每次對話寫一個紀錄檔 chat_quote_YYYYMMDD_HHMMSS.log（第一則使用者訊息時建立；
+   「重新開始」後是新的對話、新的檔案）。內容為逐則訊息與當下報價狀態；寫檔失敗不影響對話。
+
 一次貼上與一問一答走同一個 analyze；金額、明細沒有第二套規則。
 """
 from __future__ import annotations
@@ -29,6 +32,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 import re
 from uuid import uuid4
 
@@ -59,16 +63,22 @@ def _money(value):
 
 
 class ChatSession:
-    def __init__(self, categories, load_catalog, *, document_id=None):
+    def __init__(self, categories, load_catalog, *, document_id=None, log_dir=None):
         self.categories = [dict(prodkind=str(c["prodkind"]), codsc=str(c["codsc"])) for c in categories]
         self._load = load_catalog
         self._document_id = document_id
+        self._log_dir = Path(log_dir) if log_dir else None
+        self.log_path = None   # 目前對話的紀錄檔；尚未有使用者訊息時為 None
+        self._logged = 0       # messages 中已寫入紀錄檔的則數
+        self._log_rotate = False
         self.messages = []
         self._clear()
+        self._log_rotate = False
         self._say(self._greeting())
 
     # ── 狀態 ──────────────────────────────────────────────
     def _clear(self):
+        self._log_rotate = True  # 重新開始＝新的對話；目前這則寫完後換新檔
         self.document_id = self._document_id or uuid4().hex
         self.category = None
         self.catalog = None
@@ -130,15 +140,64 @@ class ChatSession:
         if not text:
             return ""
         self.messages.append(dict(role="user", content=text))
-        return self._say(self._handle(text))
+        reply = self._say(self._handle(text))
+        self._write_log()
+        return reply
 
     def reset(self):
         self._clear()
-        self.messages = []
+        self._write_log("（按鈕）重新開始")
+        self.messages, self._logged = [], 0
         return self._say(self._greeting())
 
     def undo(self):
-        return self._say(self._undo())
+        reply = self._say(self._undo())
+        self._write_log("（按鈕）復原上一步")
+        return reply
+
+    # ── 對話紀錄 ──────────────────────────────────────────
+    def _log_state(self):
+        if self.category is None:
+            return "尚未選擇產品類別"
+        view = self.quote()
+        items = "；".join(f"{i['name']} ×{i['qty']} " + ("完整" if i["ready"] else f"缺{len(i['gaps'])}項")
+                         + (f" 小計{i['amount']}" if i["amount"] else "") + (f" 單號{i['ref_no']}" if i["ref_no"] else "")
+                         for i in view["items"]) or "無品項"
+        totals = view["totals"]
+        return (f"類別 {self.category['prodkind']}｜{items}｜未稅 {totals['untaxed']}、稅額 {totals['tax']}、"
+                f"總額 {totals['total']}｜" + ("完整" if totals["complete"] else "未完整"))
+
+    def _write_log(self, event=None):
+        """把尚未記錄的訊息與當下狀態附加到本次對話的紀錄檔；任何寫檔錯誤都不影響對話。"""
+        if self._log_dir is None:
+            return
+        try:
+            now = datetime.now().astimezone()
+            if self.log_path is None:
+                if not any(m["role"] == "user" for m in self.messages):
+                    return  # 還沒有使用者訊息的對話不建立紀錄檔
+                self._log_dir.mkdir(parents=True, exist_ok=True)
+                stem, n = "chat_quote_" + now.strftime("%Y%m%d_%H%M%S"), 1
+                self.log_path = self._log_dir / f"{stem}.log"
+                while self.log_path.exists():  # 同一秒開始的另一場對話
+                    n += 1
+                    self.log_path = self._log_dir / f"{stem}_{n}.log"
+            stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            names = {"user": "使用者", "assistant": "助理"}
+            lines = [f"[{stamp}] 操作：{event}"] if event else []
+            for message in self.messages[self._logged:]:
+                body = message["content"].replace("\n", "\n    ")
+                lines.append(f"[{stamp}] {names[message['role']]}：{body}")
+            lines.append(f"[{stamp}] 狀態：{self._log_state()}")
+            with self.log_path.open("a", encoding="utf-8") as stream:
+                stream.write("\n".join(lines) + "\n")
+            self._logged = len(self.messages)
+        except Exception:
+            pass
+        finally:
+            if self._log_rotate and self.log_path is not None:
+                self.log_path = None
+            self._log_rotate = False
 
     def _undo(self):
         if self.saved_items:
@@ -627,4 +686,5 @@ class ChatSession:
                                          confirmation_id=receipt["confirmation_id"], actor=actor)
             self._history = []
         self._say(f"已保存到資料庫（ordqdt_ai），每個項目各一個單號：{self._refs()}。要建立新報價請輸入「重新開始」。")
+        self._write_log(f"（按鈕）保存到資料庫，操作人 {actor}")
         return deepcopy(self.saved_items)

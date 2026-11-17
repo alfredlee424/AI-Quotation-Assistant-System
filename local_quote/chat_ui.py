@@ -19,6 +19,7 @@ from local_quote.dynamic_presentation import safe_cell, tsv
 from local_quote.storage import StorageError
 
 RED = "#d32f2f"
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs"  # 每次對話一個 chat_quote_日期_時間.log
 
 
 @st.cache_resource
@@ -168,7 +169,7 @@ def main():
     if "chat" not in st.session_state:
         try:
             master, _ = services()
-            st.session_state.chat = ChatSession(master.categories(), master.catalog)
+            st.session_state.chat = ChatSession(master.categories(), master.catalog, log_dir=LOG_DIR)
         except Exception:
             st.error("無法讀取主檔：請確認 .env 的本機資料庫連線（DB_CONN_STR、WORKGROUP）與既有資料表。")
             return

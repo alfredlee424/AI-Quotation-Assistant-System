@@ -1,6 +1,8 @@
 """對話式報價（app.py）離線測試：以 docs/ord*.txt 主檔匯出與 logs/sem.txt 驗證一次貼上與一問一答。"""
 from decimal import Decimal
 from pathlib import Path
+import re
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -301,6 +303,34 @@ class ChatQuoteTests(unittest.TestCase):
         other.send("下板 3.5夾板、下板 4.75MDF\n黑色漆")
         self.assertTrue([i for i in other.children[0]["issues"] if i["kind"] == "conflict"])
 
+    def test_each_conversation_writes_its_own_log_file(self):
+        with TemporaryDirectory() as directory:
+            master = OfflineMaster()
+            chat = ChatSession(master.categories(), master.catalog, log_dir=directory)
+            self.assertEqual(list(Path(directory).iterdir()), [])  # 還沒有使用者訊息：不建立空檔
+            chat.send("CMTA")
+            first = chat.log_path
+            self.assertRegex(first.name, r"^chat_quote_\d{8}_\d{6}(_\d+)?\.log$")
+            chat.send("列席 平直60*150 10張")
+            chat.send("火星木皮")
+            chat.undo()
+            text = first.read_text(encoding="utf-8")
+            self.assertIn("助理：請先決定產品類別", text)
+            self.assertIn("使用者：列席 平直60*150 10張", text)
+            self.assertIn("助理：主檔找不到「火星木皮」，未加入", text)
+            self.assertIn("操作：（按鈕）復原上一步", text)
+            self.assertIn("狀態：類別 CMTA｜列席 ×10 缺4項", text)
+            self.assertEqual(len(re.findall(r"使用者：", text)), 3)  # 每則只記一次
+            chat.send("重新開始")  # 新的對話 → 新的紀錄檔（同一秒則加序號）
+            self.assertIn("使用者：重新開始", first.read_text(encoding="utf-8"))
+            chat.send("2")
+            self.assertNotEqual(chat.log_path, first)
+            self.assertEqual(len(list(Path(directory).glob("chat_quote_*.log"))), 2)
+            self.assertNotIn("火星木皮", chat.log_path.read_text(encoding="utf-8"))  # 不含上一場對話的內容
+            self.assertEqual(first.read_text(encoding="utf-8").count("使用者：2"), 0)
+        blocked = ChatSession(master.categories(), master.catalog, log_dir="/dev/null/不能建立")
+        self.assertIn("CMTA", blocked.send("CMTA"))  # 寫檔失敗不影響對話
+
     def test_statement_overrides_an_earlier_answer(self):
         chat = session()
         chat.send("CMTA\n列席 平直60*150 10張")
@@ -435,6 +465,12 @@ class ChatUiTests(unittest.TestCase):
         services = patch.object(chat_ui, "services", return_value=(OfflineMaster(), self.store))
         services.start()
         self.addCleanup(services.stop)
+        logs = TemporaryDirectory()
+        self.addCleanup(logs.cleanup)
+        self.logs = Path(logs.name)
+        log_dir = patch.object(chat_ui, "LOG_DIR", self.logs)  # 測試不寫入專案 logs/
+        log_dir.start()
+        self.addCleanup(log_dir.stop)
         self.app = AppTest.from_string(UI_SCRIPT, default_timeout=30).run()
 
     def say(self, text):
@@ -484,6 +520,12 @@ class ChatUiTests(unittest.TestCase):
         self.app.button(key="chat_reset").click().run()
         self.assertFalse(self.app.dataframe)
         self.assertEqual(len(self.app.chat_message), 1)
+        logs = list(self.logs.glob("chat_quote_*.log"))
+        self.assertEqual(len(logs), 1)  # 這場對話一個紀錄檔
+        text = logs[0].read_text(encoding="utf-8")
+        self.assertIn("使用者：列席 平直60*150 10張", text)
+        self.assertIn("操作：（按鈕）復原上一步", text)
+        self.assertIn("操作：（按鈕）重新開始", text)
 
     def test_save_button_needs_complete_quote_actor_and_confirmation(self):
         self.say("CMTA")
