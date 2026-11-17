@@ -627,7 +627,7 @@ def test_service_does_not_import_ui_models_or_old_save_and_no_production_wiring(
     for folder in ("utils", "agent"):
         for path in (root / folder).glob("*.py"):
             assert "development_atomic" not in path.read_text(encoding="utf-8")
-    assert "development_atomic" not in (root / "app.py").read_text(encoding="utf-8")
+    assert "development_atomic" not in (root / "legacy_app.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("kind", ["fk", "check", "row_unique", "header_trigger"])

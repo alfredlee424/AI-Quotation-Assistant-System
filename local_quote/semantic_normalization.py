@@ -14,6 +14,11 @@ from . import dynamic_v1 as v1
 SHAPES = {"彎角": "corner", "平直": "straight", "平彎": "curved",
           "平直雙彎": "double_curved", "四邊稍導角": "chamfered", "1/4圓": "quarter_round"}
 SHAPE_RE = r"平直雙彎|四邊稍導角|1/4圓|彎角|平直|平彎"
+# 無單位且兩軸皆 ≤ TAIWAN_FOOT_MAX 視為台尺；1 台尺 = 30.3 公分（業務慣例）。
+# 換算後只列「每軸差距 ≤ TAIWAN_FOOT_TOLERANCE_CM」的主檔尺寸為候選，必須人工選取。
+TAIWAN_FOOT_MAX = Decimal("10")
+TAIWAN_FOOT_CM = Decimal("30.3")
+TAIWAN_FOOT_TOLERANCE_CM = Decimal("5")
 DIMENSION = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(台尺|臺尺|公分|毫米|cm|mm)?"
                        r"\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*(台尺|臺尺|公分|毫米|cm|mm)?", re.I)
 
@@ -21,6 +26,18 @@ DIMENSION = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(台尺|臺尺|公分|毫�
 def parse(source, cat):
     products, ledger, pending, errors = [], [], [], []
     group, counts, seen, latest, block = "default", {}, set(), None, None
+    # 品項行開頭的名稱（列席／主席／轉角…）可當作條件行的作用對象。
+    item_labels = {item_label(m[1]) for m in map(v1._ITEM.fullmatch, map(str.strip, source["text"].splitlines()))
+                   if m and item_label(m[1])}
+    names = "|".join(map(re.escape, sorted(item_labels | {"主席", "列席"}, key=len, reverse=True)))
+    prefixes = {"規格", *NAME_AREAS, *(v1._norm(label) for label in cat.get("labels", {}).values() if label)}
+
+    def expand(body):
+        """「部位：A、B」→「部位 A，部位 B」；「每桌1個：A、B」同理；其餘頓號視同逗號分段。"""
+        head = re.fullmatch(r"([^：:、，]+?)\s*[：:]\s*(.+)", body)
+        if head and (v1._norm(head[1]) in prefixes or PER_TABLE.fullmatch(head[1].strip())):
+            return "，".join(f"{head[1].strip()} {part.strip()}" for part in re.split(r"[、，]", head[2]) if part.strip())
+        return body.replace("、", "，")
 
     def error(record, message):
         errors.append(v1._issue(f"source:{record['line']}", message, source_line=record["line"],
@@ -54,11 +71,13 @@ def parse(source, cat):
             end_block()
             record["scope"] = "header"
             continue
-        category_header = re.fullmatch(r"(.+?)[（(]([A-Za-z0-9_-]+)[）)]", text)
+        category_header = re.fullmatch(r"(.*?)[（(]([A-Za-z0-9_-]+)[）)]", text)
         if category_header:
             end_block()
+            # 可只寫代碼「(CMTA)」；寫名稱時須與主檔名稱相符。
             if (counts.get(group, 0) or category_header[2] != cat["prodkind"]
-                    or v1._norm(category_header[1]) != v1._norm(cat["category"]["codsc"])):
+                    or (category_header[1].strip()
+                        and v1._norm(category_header[1]) != v1._norm(cat["category"]["codsc"]))):
                 error(record, "產品類別標頭須在品項之前，且名稱與代碼必須符合所選主檔")
             else:
                 record["scope"] = "category_header"
@@ -66,13 +85,16 @@ def parse(source, cat):
         shared = re.fullmatch(r"共用(?:\[除([\d,， ]+)\])?[：:]\s*(.*)", text)
         targeted = re.fullmatch(r"第([1-9]\d*)項(?:配件)?[：:]\s*(.+)", text)
         local = re.fullmatch(r"(?:局部|配件|每桌配件)[：:]\s*(.+)", text)
-        selector = re.fullmatch(r"(主席及彎角桌|列席桌)(.+)", text)
+        # 角色選擇：主席及彎角桌／主席及列席／列席（桌）／主席（桌）；品項行（-----N）優先。
+        selector = (None if v1._ITEM.fullmatch(text) else
+                    re.fullmatch(rf"((?:{names})(?:及(?:{names}))*)\s*[：:\s]\s*(\S.*)", text)
+                    or re.fullmatch(r"(主席及彎角桌|主席及列席|列席|主席)(?:\s*桌(?![面下腳]))?\s*[：:]?\s*(\S.*)", text))
         if shared or targeted or local or selector:
             end_block()
             excludes = [int(n) for n in re.findall(r"\d+", shared[1] or "")] if shared else []
             scope = "shared" if shared else "targeted" if selector else "local"
             target = (selector[1] if selector else int(targeted[1]) if targeted else latest)
-            body = shared[2] if shared else targeted[2] if targeted else local[1] if local else selector[2]
+            body = expand(shared[2] if shared else targeted[2] if targeted else local[1] if local else selector[2])
             if shared and not body:
                 record.update(scope="shared_header", excludes=excludes)
                 block = dict(record=record, excludes=excludes, has_body=False)
@@ -86,19 +108,23 @@ def parse(source, cat):
             latest = counts[group]
             cid = "child-" + v1._digest([source["document_id"], cat["workgroup"], cat["prodkind"], group, latest])[:24]
             role = re.match(r"(主席|列席)", match[1].strip())
-            shape = re.match(r"(?:主席|列席)?(" + SHAPE_RE + r")", match[1].strip())
+            # 自訂品項名稱（轉角…）只用於條件行對象，不當規格解析；主席／列席仍為角色。
+            label = item_label(match[1])
+            description = match[1].strip()[len(label):].strip() if label and label not in ("主席", "列席") else match[1]
+            shape = re.match(r"(?:主席|列席)?\s*(" + SHAPE_RE + r")", description.strip())
             product = dict(id=cid, ordinal=len(products) + 1, group=group, group_ordinal=latest,
                            source_line=number, description=raw, product_qty=int(match[2]),
                            role={"主席": "chair", "列席": "attendee"}.get(role[1]) if role else None,
-                           shape=SHAPES[shape[1]] if shape else None, source_fragments=[])
+                           shape=SHAPES[shape[1]] if shape else None, label=label,
+                           source_fragments=[])
             products.append(product)
             record.update(scope="product", child_ids=[cid])
             # 保留舊片段形式，resolution identity 仍是原片段的行／hash。
-            product["source_fragments"].append(dict(line=number, raw=raw, text=match[1] + " " + match[3],
+            product["source_fragments"].append(dict(line=number, raw=raw, text=description + " " + match[3],
                                                      scope="product", excludes=[], targets=[latest]))
         elif block:
             block["has_body"] = True
-            pending.append((record, text, "shared", None, block["excludes"]))
+            pending.append((record, expand(text), "shared", None, block["excludes"]))
         else:
             error(record, "未確認原文或作用範圍；請明示共用／第N項／配件：" + raw)
     end_block()
@@ -107,10 +133,10 @@ def parse(source, cat):
         def applies(p):
             if scope == "shared":
                 return p["group_ordinal"] not in excludes
-            if target == "主席及彎角桌":
-                return p["role"] == "chair" or p["shape"] == "corner"
-            if target == "列席桌":
-                return p["role"] == "attendee"
+            if isinstance(target, str):
+                return any(name == p["label"] or (name == "主席" and p["role"] == "chair")
+                           or (name == "列席" and p["role"] == "attendee")
+                           or (name == "彎角桌" and p["shape"] == "corner") for name in target.split("及"))
             return p["group_ordinal"] == target
         targets = [p for p in available if applies(p)]
         if not targets or any(n not in {p["group_ordinal"] for p in available} for n in excludes):
@@ -122,6 +148,57 @@ def parse(source, cat):
     if not products:
         errors.append(v1._issue("source:empty", "至少需要一個『品項-----正整數』"))
     return products, ledger, errors
+
+
+def item_label(description):
+    """品項描述中外型前的中文名稱（列席平直60*150 → 列席；轉角 1/4圓60*60 → 轉角）。"""
+    match = re.match(r"([\u4e00-\u9fff]{2,}?)\s*(?:" + SHAPE_RE + r")", description.strip())
+    return match[1] if match else None
+
+
+def master_names(cat):
+    """可整段指定的主檔規格名稱（正規化）；純尺寸與外型詞仍走型別化解析。"""
+    names = set()
+    for options in cat["options"].values():
+        for o in options:
+            name = v1._norm(o["codsc"])
+            if (o.get("structural") or len(name) < 3 or name in {v1._norm(s) for s in SHAPES}
+                    or re.fullmatch(r"[\d.]+\*[\d.]+", name)):
+                continue
+            names.add(name)
+    return names
+
+
+PER_TABLE = re.compile(r"每(?:桌|件)\s*[1-9]\d*\s*(?:個|組|件|片|孔)?")
+# 整段主檔名稱前可加的部位詞（對應 path_traits 的 area）。
+NAME_AREAS = {"桌面": "tabletop", "面": "tabletop", "隔板": "divider", "木腳": "legs", "桌腳": "legs", "腳": "legs"}
+
+
+def whole_name(key, text, source, names, labels=()):
+    """整個片段（可含「每桌N個」）恰為主檔規格名稱時回傳單一 master_name 需求，否則 None。
+
+    名稱前可加「規格」、部位詞（腳／隔板／桌面）或主檔部位名稱（例：隔板40高 隔板靠單），
+    只用來縮小候選部位。"""
+    match = re.fullmatch(r"(?:每(?:桌|件)\s*([1-9]\d*)\s*(?:個|組|件|片|孔)?\s*)?(.+)", text.strip())
+    if source.get("scope") == "product":
+        return None
+    name, qualifier = v1._norm(match[2]), None
+    if name not in names:
+        prefixes = sorted({"規格", *NAME_AREAS, *labels}, key=len, reverse=True)
+        found = next(((q, name[len(q):]) for q in prefixes if name.startswith(q) and name[len(q):] in names), None)
+        if found is None:
+            return None
+        qualifier, name = found[0] if found[0] != "規格" else None, found[1]
+    value = match[2].strip() if v1._norm(match[2]) == name else name
+    raw = source["raw"]
+    column = raw.find(text.strip())
+    origin = dict(source, text=text.strip(), span=[0, len(text)],
+                  column=column + 1 if column >= 0 else None,
+                  end_column=column + len(text.strip()) + 1 if column >= 0 else None)
+    return [dict(id=f"{key}:typed:0", kind="master_name", part="explicit_name", attribute="master_name",
+                 targets=source.get("targets", []), value=value, quantity=match[1], qualifier=qualifier,
+                 basis="per_product", origin=origin, priority=10 if source["scope"] == "shared" else 20,
+                 effective=True, override=[], conflict=[], status="parsed")]
 
 
 def normalize(key, text, source):
@@ -181,7 +258,8 @@ def normalize(key, text, source):
     scan(r"單面置物[版板]", "shelf", "shelf", "single_sided", "1")
     scan(r"腳粒鎖好", "assembly", "legs", "foot_lock", "1")
     scan(r"撕保護膜", "assembly", "tabletop", "remove_protective_film", "1")
-    scan(r"(?:面)?817胡(?:桃)?", "material", "tabletop", "817_walnut", "1")
+    # 前綴「腳／隔板」時不是桌面面材，留給整段主檔名稱依部位詞處理。
+    scan(r"(?<![腳板])(?<![腳板]\s)(?:面)?817胡(?:桃)?", "material", "tabletop", "817_walnut", "1")
     scan(r"(?:面)?紅胡340", "material", "tabletop", "340_red_walnut", "1")
     scan(r"面808白橡", "material", "tabletop", "808_white_oak", "1")
     scan(r"腳白橡紙", "material", "legs", "white_oak_paper", "1")
@@ -199,6 +277,13 @@ def normalize(key, text, source):
     for m in DIMENSION.finditer(text):
         units = [u.lower().replace("臺尺", "台尺").replace("公分", "cm").replace("毫米", "mm") for u in (m[2], m[4]) if u]
         unit = units[-1] if units else None
+        first, second = Decimal(m[1]), Decimal(m[3])
+        if not units and 0 < first <= TAIWAN_FOOT_MAX and 0 < second <= TAIWAN_FOOT_MAX:
+            value = dict(axes=[str(first), str(second)], unit="台尺", confirmation_required=False,
+                         approximate=True, conversion="1台尺=30.3公分",
+                         converted_cm=[str(first * TAIWAN_FOOT_CM), str(second * TAIWAN_FOOT_CM)])
+            emit(m, "dimension", "tabletop", value, "1")
+            continue
         pending = "台尺" in units or len(set(units)) > 1 or (not unit and min(Decimal(m[1]), Decimal(m[3])) < 10)
         scale = Decimal("0.1") if unit == "mm" and not pending else Decimal(1)
         value = dict(axes=[str(Decimal(m[1]) * scale), str(Decimal(m[3]) * scale)],
@@ -217,7 +302,7 @@ def resolve(requirements):
     """每 child 獨立做屬性優先級；保留被覆寫來源，等級相同的真矛盾阻擋。"""
     groups = {}
     for r in requirements:
-        if r["kind"] in {"unknown", "legacy", "configuration", "role"}:
+        if r["kind"] in {"unknown", "legacy", "configuration", "role", "master_name"}:
             continue
         slot = (r["part"], r["attribute"])
         # 不同 assembly 是不同工序，不是互相覆寫。
@@ -286,6 +371,11 @@ def path_traits(cat, path):
     return area, label, ancestors
 
 
+def is_box_label(label):
+    """受控部位別名；不將所有含『盒』的部位視為線盒。"""
+    return any(word in label for word in ("線盒", "鋁毛刷盒"))
+
+
 def paths_for(cat, r):
     kind, part = r["kind"], r["part"]
     result = []
@@ -304,7 +394,7 @@ def paths_for(cat, r):
         elif kind == "edge":
             matched = any(w in label for w in ("修邊", "削角", "邊加工", "導角"))
         elif kind == "box":
-            matched = "線盒" in label
+            matched = is_box_label(label)
         elif kind == "hole":
             matched = "孔" in label and not any(w in label for w in ("位置", "孔位", "走線"))
             if r["value"]["shape"] == "round":
@@ -316,12 +406,14 @@ def paths_for(cat, r):
         elif kind == "shelf":
             matched = "置物" in label
         elif kind == "material":
-            matched = any(w in label for w in ("美耐板", "美耐皿", "貼皮", "面材", "飾面", "木紋紙", "腳材", "板材"))
+            matched = any(w in label for w in ("美耐板", "美耐皿", "貼皮", "面材", "飾面", "木紋紙", "腳材", "板材", "貼紙"))
         elif kind == "coating":
             matched = any(w in label for w in ("塗裝", "油漆", "噴漆", "面漆"))
         elif kind == "assembly":
             matched = (any(w in label for w in ("腳粒", "腳墊", "組裝")) if r["value"] == "foot_lock"
-                       else any(w in label for w in ("保護膜", "包裝", "組裝")))
+                       else any(w in label for w in ("保護膜", "組裝"))
+                       or ("包裝" in label and any(matches(r, o, cat) for o in cat["options"].get(path, []))))
+            # 一般『包裝』不等於『撕保護膜』，也不能因撕膜缺主檔而封鎖必選包裝費。
         elif kind == "position":
             matched = any(w in label for w in ("位置", "孔位"))
             if part.endswith("hole"):
@@ -354,19 +446,45 @@ ALIASES = {
 }
 
 
-def matches(r, option):
+def taiwan_foot_distance(value, label):
+    """台尺換算後與主檔標籤（公分）的最大軸差；超出容許差或標籤無單一尺寸則 None。"""
+    found = list(v1._DIM.finditer(label))
+    if len(found) != 1 or re.search(r"台尺|臺尺|mm|毫米", label, re.I):
+        return None
+    target = [Decimal(x) for x in value["converted_cm"]]
+    actual = [Decimal(found[0][1]), Decimal(found[0][2])]
+    distance = min(max(abs(a - t) for a, t in zip(actual, order)) for order in (target, target[::-1]))
+    return distance if distance <= TAIWAN_FOOT_TOLERANCE_CM else None
+
+
+def _node_label(cat, path):
+    node = cat["nodes"].get(path) if cat else None
+    return cat["labels"].get(node["optnoc"], "") if node else ""
+
+
+def matches(r, option, cat=None):
+    """cat 提供時可參考部位名稱：如「鋁毛刷盒」本身即滿足毛刷、「桌下走線槽」各規格皆為候選。"""
     value, label = r["value"], option["codsc"]
+    node_label = _node_label(cat, option.get("path"))
     if option.get("structural"):
         return False
+    if r["kind"] == "dimension" and value.get("approximate"):
+        return taiwan_foot_distance(value, label) is not None
     if r["kind"] == "dimension":
         return not value["confirmation_required"] and v1._same_dimensions(label, "X".join(value["axes"]))
     if r["kind"] == "box":
         return ("單掀" in label and "鋁" in label and v1._same_dimensions(label, value["dimensions"], reverse=True)
-                and (not value["color"] or "銀" in label) and (not value["brush"] or "毛刷" in label))
+                and (not value["color"] or "銀" in label)
+                and (not value["brush"] or "毛刷" in label or "毛刷" in node_label))
     if r["kind"] == "hole":
         if value["shape"] == "rectangle":
             return v1._same_dimensions(label, value["dimensions"], reverse=True)
         diameter = re.search(r"(\d+(?:\.\d+)?)\s*(公分|cm|毫米|mm)", label, re.I)
         return bool("圓" in label and diameter and Decimal(diameter[1]) *
                     (Decimal("0.1") if diameter[2].lower() in {"mm", "毫米"} else 1) == Decimal(value["diameter"]))
+    if r["kind"] == "routing" and value == "cable_routing" and any(w in node_label for w in ("走線槽", "桌下槽")):
+        return True  # 原文未指定槽型：該部位各規格均為合法候選，由人工選取
+    if r["kind"] == "material":
+        # 面材以色號／材質為準：「808白橡」可對「808白橡木」、「白橡紙」可對「4*8*3mm MDF白橡紙」。
+        return any(v1._norm(s) in v1._norm(label) for s in ALIASES.get(value, ()))
     return v1._norm(label) in {v1._norm(s) for s in ALIASES.get(value, ())}

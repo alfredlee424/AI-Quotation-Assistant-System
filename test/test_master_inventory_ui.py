@@ -88,7 +88,7 @@ def test_main_workspace_stops_before_seed_or_quote_flow(monkeypatch):
     query = Mock(side_effect=AssertionError("禁止自動查詢"))
     monkeypatch.setattr(seed_data, "seed", seed)
     monkeypatch.setattr(repository, "_session", query)
-    app = AppTest.from_file("../app.py")
+    app = AppTest.from_file("../legacy_app.py")
     app.session_state.workspace = "產品線主檔盤點"
     app.session_state.current_quote = {"marker": "single"}
     app.run()

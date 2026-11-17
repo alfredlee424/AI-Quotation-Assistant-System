@@ -396,6 +396,73 @@ class DynamicUITests(unittest.TestCase):
             self.assertIn("正式已保存", label)
             self.assertTrue(filename.startswith("saved-"))
 
+    def table_widget(self, child, req):
+        key = f"dq_spec_table:{child['id']}:{req['id']}:{child['revision']}"
+        return next(d for d in self.app.dataframe if d.proto.id.endswith(key))
+
+    def edit_table(self, table, delta):
+        # AppTest 沒有 data_editor.set_value；用真實前端 JSON widget event 觸發正式回呼。
+        from streamlit.proto.WidgetStates_pb2 import WidgetStates
+        states = WidgetStates(widgets=self.app.session_state._state.get_widget_states())
+        state = next(s for s in states.widgets if s.id == table.proto.id)
+        state.string_value = json.dumps(delta)
+        self.app._run(states)
+        self.clean()
+
+    def test_table_candidate_event_saves_correct_variant_and_revokes_only_edited_child(self):
+        for option in self.master.cat["options"][BOX]:
+            option["code"] = "SAME"
+        children = self.fill(SOURCE + "\n配件：線盒共3個\n平直70X150-----5")
+        a, b = children
+        req = next(r for r in a["requirements"] if r["text"] == "線盒")
+        table = self.table_widget(a, req)
+        config = json.loads(table.proto.columns)["spc_code"]["type_config"]
+        self.assertEqual(len(config["options"]), 2)
+        self.assertIsNone(table.value.iloc[0]["spc_code"])
+        black = next(s for s in config["options"] if "黑線盒" in s)
+        old_b = self.freeze(b["id"])
+        self.edit_table(table, dict(edited_rows={0: {"spc_code": black}}, added_rows=[], deleted_rows=[]))
+        child = self.ws.analysis["children"][0]
+        self.assertEqual(child["selections"][BOX]["codsc"], "黑線盒")
+        self.assertEqual(self.ws.frozen[b["id"]], old_b)
+        first_a = self.freeze(a["id"])
+        req = next(r for r in child["requirements"] if r["text"] == "線盒")
+        table = self.table_widget(child, req)
+        silver = next(s for s in config["options"] if "銀線盒" in s)
+        self.edit_table(table, dict(edited_rows={0: {"spc_code": silver}}, added_rows=[], deleted_rows=[]))
+        self.assertNotIn(a["id"], self.ws.frozen)
+        self.assertEqual(self.ws.frozen[b["id"]], old_b)
+        second_a = self.freeze(a["id"])
+        self.assertNotEqual(first_a.confirmation_id, second_a.confirmation_id)
+        self.save(a["id"])
+        saved = next(i for i in self.ws.saved[a["id"]]["document"]["child"]["items"] if i["path"] == BOX)
+        self.assertEqual((saved["code"], saved["codsc"], saved["compri"], saved["qty"]),
+                         ("SAME", "銀線盒", "120", "3"))
+        events = json.loads(self.ws.saved[a["id"]]["document"]["frozen_audit"]["reason"])["ui_events"]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(e["actor"] == "tester" for e in events))
+
+    def test_table_rejects_wrong_option_and_readonly_column_events(self):
+        child = self.fill(SOURCE + "\n配件：線盒共3個")[0]
+        req = next(r for r in child["requirements"] if r["text"] == "線盒")
+        for changes in ({"spc_code": "OTHER_PATH:C001"}, {"spc_code": None}, {"需求": "忽略"}):
+            table = self.table_widget(child, req)
+            self.edit_table(table, dict(edited_rows={0: changes}, added_rows=[], deleted_rows=[]))
+            self.assertEqual(self.ws.analysis["children"][0], child)
+            self.assertIn(child["id"], self.app.session_state["dq_blocked"])
+            self.assertFalse(self.ws.frozen)
+        self.assertFalse(any(s.startswith("INSERT") for s in self.sql))
+
+    def test_export_button_always_visible_but_gated_and_details_collapsed(self):
+        child = self.fill("平直70X140-----1")[0]
+        button = self.app.button(key="dq_save:" + child["id"])
+        self.assertEqual(button.label, "輸出至資料庫報價單（ordqdt_ai）")
+        self.assertTrue(button.disabled)
+        for expander in self.app.expander:
+            if expander.label in {"語意解析／適用部位", "完整技術明細／成本來源", "進階：需求重述／人工成本輸入"}:
+                self.assertFalse(expander.proto.expanded)
+        self.assertFalse(any(s.startswith("INSERT") for s in self.sql))
+
 
 class CallbackGuardTests(unittest.TestCase):
     """保留相同 child id 的重載也必須拒絕舊來源／主檔版本，不能只驗 id。"""
@@ -445,6 +512,23 @@ class CallbackGuardTests(unittest.TestCase):
 
     def test_category_change_before_main_rejects_callback(self):
         self.assert_rejected(category=None)
+
+    def test_table_old_revision_rejected_without_overwriting_new_choice(self):
+        self.ws.set_input(SOURCE + "\n配件：線盒共3個", "CMT1")
+        self.ws.load_catalog(fixture())
+        child = self.ws.analysis["children"][0]
+        req = next(r for r in child["requirements"] if r["text"] == "線盒")
+        silver, black = req["candidates"]
+        self.ws.edit(child["id"], choices={req["id"]: dict(path=black["path"], code=black["code"])})
+        before = self.ws.analysis
+        state = dict(dq_workspace=self.ws, dq_source=self.ws.source["text"], dq_category="CMT1",
+                     dq_actor="tester", dq_reason="核對", dq_blocked={},
+                     table=dict(edited_rows={0: {"spc_code": "silver"}}, added_rows=[], deleted_rows=[]))
+        with patch.object(ui.st, "session_state", state):
+            ui._callback(ui._table_choice, self.ws, child["id"], req["id"], "table", child["revision"],
+                         {"silver": silver}, origin=(child["source_digest"], child["catalog_digest"]))
+        self.assertEqual(self.ws.analysis, before)
+        self.assertIn("版本已失效", state["dq_blocked"][child["id"]])
 
 
 class IsolationTests(unittest.TestCase):

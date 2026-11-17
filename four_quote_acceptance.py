@@ -17,6 +17,8 @@ def main(argv=None) -> int:
     mode.add_argument("--directory", help="私有隔離 SQLite 驗收目錄")
     mode.add_argument("--local-db", action="store_true", help="依 .env 連線本機 MySQL／MSSQL；僅 UI 確認後保存")
     parser.add_argument("--initialize", action="store_true", help="只接受全新私有目錄")
+    parser.add_argument("--combined", action="store_true",
+                        help="搭配 --local-db：整份工單不拆單，併為一張報價（每個 A001／B001 區塊各自檢查必填）")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.local_db:
@@ -24,7 +26,11 @@ def main(argv=None) -> int:
             parser.error("本機模式禁止初始化或建表")
         # 在匯入 acceptance 前分流；本機引擎絕不注入隔離驗收。
         from local_quote.bootstrap import launch
+        if args.combined:
+            return launch(worker=args.worker, combined=True)
         return launch(worker=args.worker)
+    if args.combined:
+        parser.error("--combined 只能搭配 --local-db")
     from acceptance.bootstrap import (BootstrapError, clean_environment,
                                       initialize_directory, isolate_process, verify_directory)
     try:

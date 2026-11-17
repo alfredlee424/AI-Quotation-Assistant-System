@@ -81,7 +81,7 @@ def test_review_ui_unknown_header_can_be_manually_promoted():
 
 
 def test_main_app_stops_review_workspace_before_initialization_or_quote_ui():
-    source = Path(__file__).resolve().parents[1] / "app.py"
+    source = Path(__file__).resolve().parents[1] / "legacy_app.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     guards = [node for node in tree.body if isinstance(node, ast.If)
               and ast.unparse(node.test) == "workspace == '生產工單核對'"]

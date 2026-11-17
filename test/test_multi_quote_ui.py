@@ -142,7 +142,7 @@ def test_configuring_second_line_retains_focus_across_reruns(cmt1_db):
 
 
 def test_main_multi_workspace_stops_before_single_initialization():
-    tree = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "legacy_app.py").read_text(encoding="utf-8"))
     guard = next(node for node in tree.body if isinstance(node, ast.If)
                  and ast.unparse(node.test) == "workspace == '多明細配置草稿'")
     assert ast.unparse(guard.body[-1]) == "st.stop()"

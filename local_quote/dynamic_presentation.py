@@ -71,6 +71,24 @@ def report_rows(child, catalog, *, receipt=None):
             for item in child["items"]]
 
 
+def compact_rows(child, catalog, *, receipt=None):
+    """操作主表只保留規格與成本；完整證據仍在技術表及13欄下載。"""
+    if receipt is not None:
+        child = receipt["document"]["child"]
+    rows = []
+    for item in child["items"]:
+        row = {"部位": "　" * max(0, item["depth"] - 1) + item["label"],
+               "spc_code": item.get("code"), "規格說明": item.get("codsc"),
+               "本張數量": _quantity(item), "用料量": item.get("stdqty"),
+               "裁切量": item.get("stdpar"), "採購單價": item.get("compri"),
+               "明細成本": item.get("part_cost"),
+               "狀態": "待選規格" if not item["selected"] else
+                       "待補成本／數量" if item.get("part_cost") is None else "已計算",
+               "path": item["path"]}
+        rows.append({key: safe_cell(value) for key, value in row.items()})
+    return rows
+
+
 def screen_rows(child, catalog, *, receipt=None):
     if receipt is not None:
         child = receipt["document"]["child"]
@@ -102,7 +120,7 @@ _TERMS = {
     "constraint": "限制（非付費數量）", "routing": "走線", "assembly": "組裝工序",
     "material": "面材", "coating": "塗裝", "position": "位置", "vertical_position": "上下位置",
     "external_confirmation": "外部確認", "configuration": "主檔配置", "role": "產品角色",
-    "legacy": "明示規格", "unknown": "未知", "round_hole": "圓孔", "rectangular_hole": "矩形孔",
+    "legacy": "明示規格", "master_name": "主檔規格名稱", "explicit_name": "依規格名稱", "unknown": "未知", "round_hole": "圓孔", "rectangular_hole": "矩形孔",
     "holes_allowed": "是否允許挖孔", "legs_allowed": "是否允許木腳", "drawing": "圖面",
     "parsed": "已解析", "matched": "已匹配", "pending_master": "待主檔／候選確認",
     "pending_units": "待單位", "pending_external": "待圖面／訂單核對", "unrecognized": "未知",
@@ -114,7 +132,8 @@ _TERMS = {
     "walnut": "胡桃", "red_wood": "紅木", "white_oak": "白橡", "center": "置中",
     "below_routing": "走線下方", "master": "依主檔", "order": "訂單", "round": "圓形",
     "rectangle": "矩形", "single_flip_aluminum": "單掀鋁", "silver": "銀色",
-    "axes": "尺寸軸", "unit": "單位", "confirmation_required": "需確認", "reference": "參照",
+    "axes": "尺寸軸", "unit": "單位", "confirmation_required": "需確認", "approximate": "近似換算",
+    "conversion": "換算", "converted_cm": "換算公分", "reference": "參照",
     "type": "型式", "dimensions": "尺寸", "color": "顏色", "brush": "毛刷", "diameter": "直徑",
     "cm": "公分", "mm": "毫米", "catalog_label": "主檔標示",
 }

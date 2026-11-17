@@ -106,7 +106,9 @@ class BlockUITests(unittest.TestCase):
                         if req["kind"] == "external_confirmation":
                             resolution = f"dq_resolution:{child['id']}:{req['source']['fragment_id']}:text"
                             self.assertFalse(any(w.key == resolution for w in self.app.text_area))
-                self.assertFalse(any("需要建立客製化新件" in e.label for e in self.app.expander))
+                # 只有台尺換算後找不到近似主檔尺寸者可建立臨時件。
+                self.assertFalse(any("需要建立客製化新件" in e.label and "視為台尺" not in e.label
+                                     for e in self.app.expander))
                 self.assertFalse(any(m.label == "本張報價（含稅）" for m in self.app.metric))
                 self.assertEqual([m.value for m in self.app.metric if m.label == "已知成本小計（非完整合計）"],
                                  [c["calc"]["known_cost"] for c in a["children"]])
@@ -139,7 +141,8 @@ class BlockUITests(unittest.TestCase):
             self.assertEqual(targeted["範圍"], "特定")
             self.assertEqual(targeted["群組內適用品項"], "1、2" if index < 2 else "3、4")
             self.assertEqual(targeted["狀態"], "待圖面／訂單核對" if index < 2 else "已匹配")
-            self.assertTrue(any(r["狀態"] == "待單位" and r["可算本張總量"] == "" for r in rows))
+            self.assertTrue(any(r["需求類型"] == "尺寸" and r["狀態"] == "待主檔／候選確認"
+                                and "單位：台尺" in r["需求"] for r in rows))
             self.assertEqual({r["部位"] for r in rows if r["需求類型"] == "面材"}, {"桌面", "桌腳"})
             self.assertEqual(next(r["每件量"] for r in rows if r["需求類型"] == "線盒"), "1")
             self.assertEqual(next(r["每件量"] for r in rows if r["需求類型"] == "挖孔"), "1")
@@ -185,7 +188,7 @@ class BlockUITests(unittest.TestCase):
                 self.assertEqual(semantic_tables(self.app), [expected])
 
     def test_units_full_fragment_restatement_only_one_child(self):
-        a = self.fill("彎角3X3.25-----2\n彎角3X3.25-----1")
+        a = self.fill("彎角3X12-----2\n彎角3X12-----1")  # 一軸 >10：仍待單位
         child = a["children"][0]
         req = next(r for r in child["requirements"] if r["kind"] == "units")
         prefix = f"dq_resolution:{child['id']}:{req['source']['fragment_id']}"
@@ -197,7 +200,7 @@ class BlockUITests(unittest.TestCase):
         self.assertFalse(second["ready"])
         self.assertNotIn("待單位", [r["狀態"] for r in semantic_tables(self.app)[0]])
         self.assertIn("待單位", [r["狀態"] for r in semantic_tables(self.app)[1]])
-        self.assertTrue(any("3X3.25" in r["來源原文"] for r in semantic_tables(self.app)[0]))
+        self.assertTrue(any("3X12" in r["來源原文"] for r in semantic_tables(self.app)[0]))
 
     def test_scope_boundary_help_and_global_guidance(self):
         self.assertIn("共用：\n", self.app.text_area(key="dq_source").proto.placeholder)

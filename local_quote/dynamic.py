@@ -68,6 +68,7 @@ from copy import deepcopy
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Context, ROUND_HALF_UP, localcontext
+import logging
 
 from . import dynamic_v1 as _v1
 from . import semantic_normalization as normalization
@@ -75,6 +76,7 @@ from .dynamic_v1 import (_INPUTS, _Child, _audit, _digest, _plain, _source)
 from .catalog import option_identity
 
 VERSION = "dynamic-2"
+_logger = logging.getLogger(__name__)
 
 
 def _catalog(snapshot):
@@ -91,6 +93,10 @@ class _TypedChild(_Child):
 
     def option_identity(self, option):
         return option_identity(self.cat, option)
+
+    def accessory(self, path):
+        label = self.cat["labels"][self.cat["nodes"][path]["optnoc"]]
+        return normalization.is_box_label(label) or super().accessory(path)
 
     def put(self, option, key, qty, basis, origin, audit=None, quantity_source="BOM_per_product_policy"):
         previous = self.child["selections"].get(option["path"])
@@ -109,8 +115,40 @@ class _TypedChild(_Child):
                 or (self.leg_holes_forbidden and area == "legs" and "孔" in ancestors
                     and any(word in ancestors for word in ("走線", "走縣"))))
 
+    def semantic_candidates(self, text, qualifier=None):
+        """完整主檔名稱出現在多個部位（桌面／隔板／木腳）時：有指明部位名稱只留該部位；
+        未指明即取桌面本體（例：3.5夾板 同時是上板與下板，兩者都套用）。"""
+        options, exact = super().semantic_candidates(text)
+        if exact and qualifier:
+            area = normalization.NAME_AREAS.get(qualifier)
+            options = [o for o in options if (normalization.path_traits(self.cat, o["path"])[0] == area if area else
+                                              qualifier in {_v1._norm(label) for label in
+                                                                           normalization.path_traits(self.cat, o["path"])[2].split("/")})]
+        elif exact and len({o["path"] for o in options}) > 1:
+            main = [o for o in options if normalization.path_traits(self.cat, o["path"])[0] == "tabletop"]
+            options = main or options
+        return options, exact
+
+    def labor_options(self, path, options):
+        """裁切／貼合工費依同區塊已選面材：有美耐板→美耐板、僅美耐皿→美耐皿、僅貼紙→色紙。"""
+        if len(options) < 2 or not any(w in self.cat["labels"][self.cat["nodes"][path]["optnoc"]]
+                                       for w in ("裁切", "貼合")):
+            return options
+        root = "\\".join(path.split("\\")[:2])
+        chosen = [p for p in self.child["selections"] if p.startswith(root + "\\")]
+        def has(word):
+            return any(word in normalization.path_traits(self.cat, p)[2] for p in chosen)
+        word = "美耐板" if has("美耐板") else "美耐皿" if has("美耐皿") else "色紙" if has("貼紙") else None
+        narrowed = [o for o in options if word and word in o["codsc"]]
+        return narrowed if len(narrowed) == 1 else options
+
     def request(self, key, text, options, **kwargs):
+        if (key.startswith("node:") and key[5:] in self.cat["nodes"] and kwargs.get("auto")
+                and key not in self.inputs["choices"] and key not in self.inputs["customs"]):
+            options = self.labor_options(key[5:], options)
         if key.startswith("node:") and key[5:] in self.blocked_paths:
+            _logger.debug("quote_node_blocked ordinal=%s path=%s candidate_count=%s auto=%s",
+                          self.child["ordinal"], key[5:], len(options), kwargs.get("auto", False))
             self.issue(key, "此部位有未滿足的型別化需求；不可由必選預設或 node 選擇取代", "requirement_pending")
             return
         if key.startswith("node:") and key[5:] in self.cat["nodes"]:
@@ -124,7 +162,7 @@ class _TypedChild(_Child):
                 while parent in self.cat["nodes"]:
                     selection = self.child["selections"].get(parent)
                     parent_label = self.cat["labels"][self.cat["nodes"][parent]["optnoc"]]
-                    if selection and "線盒" in parent_label:
+                    if selection and normalization.is_box_label(parent_label):
                         kwargs.update(qty=selection["line_qty"], basis=selection["quantity_basis"],
                                       quantity_source="parent_accessory:" + parent)
                         break
@@ -133,11 +171,22 @@ class _TypedChild(_Child):
 
     def normalized(self):
         rows = []
+        names = normalization.master_names(self.cat)
+        labels = {_v1._norm(label) for label in self.cat["labels"].values() if label}
+
+        def parse(key, text, evidence):
+            # 型別化解析優先；留下未知文字，或非品項行把規格名稱內的「40*13.5」當成桌面尺寸時，
+            # 才以整段完整主檔名稱取代。
+            typed = normalization.normalize(key, text, evidence)
+            if typed and all(r["kind"] not in {"unknown", "dimension"} for r in typed):
+                return typed
+            return normalization.whole_name(key, text, evidence, names, labels) or typed
+
         for key, text, evidence in self.fragments():
-            parsed = normalization.normalize(key, text, evidence)
+            parsed = parse(key, text, evidence)
             # resolution 不可把已辨識需求改成「主檔配置」等空操作。
             if evidence.get("resolution"):
-                original = normalization.normalize(key, evidence["original"], evidence)
+                original = parse(key, evidence["original"], evidence)
                 needed = Counter((r["part"], r["kind"], r["attribute"]) for r in original
                                  if r["kind"] not in {"unknown", "configuration", "role"})
                 supplied = Counter((r["part"], r["kind"], r["attribute"]) for r in parsed)
@@ -147,6 +196,18 @@ class _TypedChild(_Child):
             rows.extend(parsed)
         self.child["normalized_requirements"] = normalization.resolve(rows)
         active = [r for r in rows if r["effective"]]
+        # 品項／角色指定的整段主檔名稱優先於共用：同一節點由較高優先者取得（例：第1項：下板 4.75MDF）。
+        # 同一層級內，指明部位者（下板 4.75MDF）優先於未指明部位、同時套到多個部位的名稱（3.5夾板）。
+        def rank(r):
+            return (r["priority"], 1 if r.get("qualifier") else 0)
+
+        claimed = {}
+        for r in active:
+            if r["kind"] == "master_name" and not r["conflict"]:
+                options, _ = self.semantic_candidates(r["value"], r.get("qualifier"))
+                if options and len(options) == len({o["path"] for o in options}):
+                    for o in options:
+                        claimed[o["path"]] = max(claimed.get(o["path"], (0, 0)), rank(r))
         self.no_holes = any(r["kind"] == "constraint" and r["part"] == "tabletop_hole" for r in active)
         self.no_legs = any(r["kind"] == "constraint" and r["part"] == "legs" for r in active)
         self.leg_holes_forbidden = any(r["kind"] == "constraint" and r["part"] == "leg_hole" for r in active)
@@ -182,7 +243,29 @@ class _TypedChild(_Child):
                 r["requirement_ids"] = [key]
                 continue
             before = len(self.child["requirements"])
-            if kind in {"legacy", "unknown"}:
+            if kind == "master_name":
+                # 整段完整主檔名稱：直接取該規格；配件未寫「每桌N個」仍不猜數量。
+                options, _ = self.semantic_candidates(r["value"], r.get("qualifier"))
+                kept = [o for o in options if claimed.get(o["path"], (0, 0)) <= rank(r)]
+                if options and not kept:
+                    r.update(effective=False, status="overridden")
+                    continue
+                options = kept
+                qty = r["quantity"] or (None if any(self.accessory(o["path"]) for o in options) else "1")
+                paths = sorted({o["path"] for o in options})
+                # 同名規格在同一部位的多個必選節點各恰一筆（上板／下板皆 3.5夾板）：逐節點套用。
+                # 選配節點互為替代（隔板40高／隔板68高），仍須指明部位名稱或人工選擇。
+                groups = ([[o for o in options if o["path"] == p] for p in paths]
+                          if len(paths) > 1 and len(options) == len(paths)
+                          and len({normalization.path_traits(self.cat, p)[0] for p in paths}) == 1
+                          and all(self.cat["nodes"][p].get("must_chose") == "Y" for p in paths) else [options])
+                for index, group in enumerate(groups):
+                    self.request(key if len(groups) == 1 else f"{key}:{index}", source["text"], group, qty=qty,
+                                 auto=True, source=source, kind="semantic",
+                                 custom_paths=sorted({o["path"] for o in group}) or None,
+                                 quantity_source="source_requirement" if r["quantity"] else
+                                 "BOM_per_product_policy" if qty else "unknown")
+            elif kind in {"legacy", "unknown"}:
                 # 舊明示語法及完整主檔名稱保留契約；未知仍走阻擋需求，不能靠 must_chose 消失。
                 unknowns = [t for t in rows if t["kind"] == "unknown"
                             and t["origin"]["fragment_id"] == source["fragment_id"]]
@@ -191,9 +274,22 @@ class _TypedChild(_Child):
                 r["status"] = "unrecognized" if kind == "unknown" else "parsed"
             else:
                 paths = normalization.paths_for(self.cat, r)
-                options = [o for p in paths for o in self.options(p) if normalization.matches(r, o)]
+                options = [o for p in paths for o in self.options(p) if normalization.matches(r, o, self.cat)]
+                if kind == "dimension" and any("1/4圓" in o["codsc"] for o in options):
+                    # 同尺寸有 1/4圓 與一般桌面：依品項外型取其一，不留給人工猜。
+                    quarter = self.child.get("shape") == "quarter_round"
+                    narrowed = [o for o in options if ("1/4圓" in o["codsc"]) == quarter]
+                    options = narrowed or options
+                _logger.debug("quote_match ordinal=%s kind=%s part=%s paths=%s candidate_count=%s",
+                              self.child["ordinal"], kind, r["part"], paths, len(options))
                 r["custom_paths"] = paths
-                self.request(key, source["text"], options, qty=r["quantity"] or "1", auto=True,
+                text = source["text"]
+                if kind == "dimension" and r["value"].get("approximate"):
+                    # 台尺換算為近似：依差距排序列候選；唯一候選自動選定，多筆須人工選取。
+                    options.sort(key=lambda o: normalization.taiwan_foot_distance(r["value"], o["codsc"]))
+                    text = (f"{text}（視為台尺，≈{'×'.join(r['value']['converted_cm'])}公分；"
+                            "請確認最接近的主檔尺寸）")
+                self.request(key, text, options, qty=r["quantity"] or "1", auto=True,
                              source=source, custom_paths=paths, kind="normalized",
                              quantity_source="source_requirement" if r["quantity"] is not None else "BOM_per_product_policy")
             emitted = self.child["requirements"][before:]
@@ -203,7 +299,9 @@ class _TypedChild(_Child):
             r["selected"] = selected[0] if len(selected) == 1 else None
             if kind not in {"legacy", "unknown"}:
                 r["status"] = "matched" if selected else "pending_master"
-                if not selected:
+                if not selected and kind != "master_name":
+                    _logger.debug("quote_requirement_pending ordinal=%s kind=%s blocked_paths=%s",
+                                  self.child["ordinal"], kind, r["custom_paths"])
                     self.blocked_paths.update(r["custom_paths"])
 
 

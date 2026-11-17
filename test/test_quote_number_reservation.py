@@ -662,7 +662,7 @@ def test_invalid_request_never_connects(registry, monkeypatch):
 def test_no_application_or_model_entry_imports_reservation():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
-    paths = [root / "app.py", *(root / "utils").glob("*.py"), *(root / "agent").glob("*.py")]
+    paths = [root / "app.py", root / "legacy_app.py", *(root / "utils").glob("*.py"), *(root / "agent").glob("*.py")]
     for path in paths:
         text = path.read_text(encoding="utf-8")
         assert "quote_number_reservation" not in text

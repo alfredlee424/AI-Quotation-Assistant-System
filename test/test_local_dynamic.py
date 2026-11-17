@@ -439,6 +439,32 @@ class DynamicTests(unittest.TestCase):
             self.assertIn("台尺" if "台尺" in text else "mm", source["original"])
             self.assertEqual(source["resolution"]["actor"], STAMP["actor"])
 
+    def test_unitless_small_numbers_are_taiwan_feet_nearest_candidates(self):
+        result = analyze("平直2.3X4-----2", self.cat)  # ≈69.69×121.2 公分
+        dimension = next(r for r in child(result)["normalized_requirements"] if r["kind"] == "dimension")
+        self.assertEqual(dimension["value"]["unit"], "台尺")
+        self.assertEqual(dimension["value"]["converted_cm"], ["69.69", "121.2"])
+        self.assertEqual([c["codsc"] for c in dimension["candidates"]], ["70*120"])
+        self.assertEqual(dimension["selected"]["code"], "D120")  # 唯一近似候選自動選定
+        self.assertEqual(dimension["status"], "matched")
+        self.assertReady(result)
+        # 多筆近似候選：依差距排序，不自動選，須人工選取。
+        cat = deepcopy(self.cat)
+        cat["options"][ROOT].append(dict(path=ROOT, code="D121", codsc="72*120", compri="0"))
+        result = analyze("平直2.3X4-----2", cat)
+        dimension = next(r for r in child(result)["normalized_requirements"] if r["kind"] == "dimension")
+        self.assertEqual([c["codsc"] for c in dimension["candidates"]], ["70*120", "72*120"])
+        self.assertIsNone(dimension["selected"])
+        gap = next(g for g in result["gaps"] if g["id"] == dimension["requirement_ids"][0])
+        self.assertIn("視為台尺", gap["message"])
+        choice = {k: dimension["candidates"][0][k] for k in ("path", "code")}
+        chosen = analyze("平直2.3X4-----2", cat, choices={gap["child_id"]: {gap["id"]: choice}})
+        self.assertEqual(item(chosen, ROOT)["code"], "D120")
+        self.assertIsNone(next(g for g in analyze("平直5X4-----2", self.cat)["gaps"]
+                               if g["kind"] == "custom_required")["candidates"] or None)
+        for text in ("平直5X14-----2", "平直2X4台尺-----2"):  # 一軸 >10 或明示台尺仍待人工確認單位
+            self.assertTrue(any(g["kind"] == "units" for g in analyze(text, self.cat)["gaps"]), text)
+
     def test_explicit_metric_dimensions_exact_no_nearest_match(self):
         self.assertReady(analyze("平直700X1200mm-----2", self.cat))
         result = analyze("平直70X140-----2", self.cat)

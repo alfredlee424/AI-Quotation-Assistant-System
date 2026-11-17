@@ -8,7 +8,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from local_quote.dynamic_presentation import (hierarchy_rows, legacy_report_rows,
+from local_quote.dynamic_presentation import (compact_rows, hierarchy_rows, legacy_report_rows,
                                               report_rows, safe_cell, screen_rows,
                                               semantic_rows, semantic_text, tsv)
 from local_quote.dynamic_storage import DynamicStore, validate_actor
@@ -98,6 +98,61 @@ def _cost(ws, cid, path, field, widget):
     values[field] = st.session_state[widget]
     overrides[path] = dict(stamp, values=values)
     _edit(ws, cid, stamp, overrides=overrides)
+
+
+def _table_choice(ws, cid, rid, widget, revision, labels):
+    """只接受當輪、該需求的一格合法候選；不信任瀏覽器傳回路徑或成本。"""
+    child = next(c for c in ws.analysis["children"] if c["id"] == cid)
+    if child["revision"] != revision:
+        raise ValueError("規格表版本已失效，請使用目前表格重新選取")
+    delta = st.session_state[widget]
+    if (not isinstance(delta, dict) or delta.get("added_rows") or delta.get("deleted_rows")
+            or set(delta.get("edited_rows", {})) != {0}
+            or set(delta["edited_rows"][0]) != {"spc_code"}):
+        raise ValueError("規格表只允許修改 spc_code，不可新增／刪除明細或修改其他欄位")
+    value = delta["edited_rows"][0]["spc_code"]
+    if not isinstance(value, str) or value not in labels:
+        raise ValueError("請選擇此部位的合法規格，不可清除或輸入其他部位代碼")
+    requirement = next(r for r in child["requirements"] if r["id"] == rid)
+    candidate = labels[value]
+    if candidate not in requirement["candidates"]:
+        raise ValueError("候選已失效，請重新選取")
+    stamp = audit()
+    choices, customs = _mapping(ws, cid, "choices"), _mapping(ws, cid, "customs")
+    choices[rid] = option_identity(ws.catalog, candidate)
+    customs.pop(rid, None)
+    _edit(ws, cid, stamp, choices=choices, customs=customs)
+
+
+def _candidate_tables(ws, child, disabled):
+    requirements = [r for r in child["requirements"] if r.get("candidates")
+                    and (len(r["candidates"]) > 1 or not r.get("selected"))]
+    if not requirements:
+        return
+    st.subheader("規格選取")
+    st.caption("點選表格 spc_code 欄的下拉選單；每列只提供該需求的合法候選，代碼旁附規格說明。"
+               "未指定顏色時不預選銀色或黑色；選取即重新分析本張，不會寫入資料庫。")
+    for req in requirements:
+        options = req["candidates"]
+        multiple_paths = len({o["path"] for o in options}) > 1
+        # 帶序號避免主檔名稱包含分隔符時碰撞；實際保存的是完整 identity，不是顯示文字。
+        labels = {safe_cell(f"{i + 1}. {o['code']} — {o['codsc']}" +
+                            (" / " + o["path"] if multiple_paths else "")): o
+                  for i, o in enumerate(options)}
+        chosen = req.get("selected")
+        selected = next((label for label, o in labels.items()
+                         if option_identity(ws.catalog, o) == chosen), None)
+        paths = list(dict.fromkeys(o["path"] for o in options))
+        row = {"部位": safe_cell("／".join(ws.catalog["labels"][ws.catalog["nodes"][p]["optnoc"]] for p in paths)),
+               "需求": safe_cell(req["text"]), "spc_code": selected}
+        widget = f"dq_spec_table:{child['id']}:{req['id']}:{child['revision']}"
+        st.data_editor([row], hide_index=True, width="stretch", num_rows="fixed",
+                       disabled=True if disabled else ["部位", "需求"],
+                       column_config={"spc_code": st.column_config.SelectboxColumn(
+                           "spc_code（代碼／規格）", options=list(labels), required=True, width="large")},
+                       key=widget, on_change=_callback,
+                       args=(_table_choice, ws, child["id"], req["id"], widget, child["revision"], labels),
+                       kwargs={"origin": (child["source_digest"], child["catalog_digest"])})
 
 
 def _selector(ws, child, requirement, disabled):
@@ -232,7 +287,7 @@ def _show(child, catalog, *, receipt=None, key):
     st.text(f"來源行 {child['source_line']}／群組 {child['group']}／成品數 {child['product_qty']}")
     if "normalized_requirements" in child:
         st.text(f"產品角色：{semantic_text(child.get('role')) or '未指定'}／外型：{semantic_text(child.get('shape')) or '未指定'}")
-        with st.expander("語意解析／適用部位", expanded=True):
+        with st.expander("語意解析／適用部位"):
             st.caption("適用品項為同群組內序號，不是件數。共用為預設，特定／品項優先；覆寫來源仍保留。"
                        "已匹配不等於成本完整；限制片數不計為付費孔數，未適用／衝突／待單位不推算總量。")
             st.dataframe(semantic_rows(child), hide_index=True, width="stretch")
@@ -240,7 +295,10 @@ def _show(child, catalog, *, receipt=None, key):
             st.json(child["normalized_requirements"])
     else:
         st.caption("舊版歷史未記錄語意解析／適用部位；依原固定明細顯示，不以新版解析器補算。")
-    st.dataframe(screen_rows(child, catalog, receipt=receipt), hide_index=True, width="stretch")
+    st.dataframe(compact_rows(child, catalog, receipt=receipt), hide_index=True, width="stretch",
+                 column_config={"path": None})
+    with st.expander("完整技術明細／成本來源"):
+        st.dataframe(screen_rows(child, catalog, receipt=receipt), hide_index=True, width="stretch")
     calc = child["calc"]
     if child["ready"]:
         cols = st.columns(3)
@@ -250,8 +308,10 @@ def _show(child, catalog, *, receipt=None, key):
     else:
         st.metric("已知成本小計（非完整合計）", calc["known_cost"])
         st.warning("尚有需求／結構／成本缺口，不可固定或保存。")
-    for issue in child["issues"]:
-        st.text("待處理：" + issue["message"])
+    if child["issues"]:
+        with st.expander(f"待處理原因（{len(child['issues'])} 項）"):
+            for issue in child["issues"]:
+                st.text("待處理：" + issue["message"])
     st.text("正式單號：" + (receipt["ref_no"] if receipt else "尚未配號"))
     _download(child, catalog, receipt=receipt, key=key)
 
@@ -267,15 +327,17 @@ def _child(ws, child, store):
         st.json(st.session_state.get("dq_events", {}).get(cid, []))
     if saved:
         st.success("本張已保存，修改與再次保存已停用；歷史不重查價。")
-    with st.expander("合法規格候選／本次臨時件", expanded=not child["ready"]):
+    _candidate_tables(ws, child, disabled)
+    with st.expander("進階：合法規格候選／本次臨時件"):
         for req in child["requirements"]:
             if req["kind"] in {"constraint", "units", "external_confirmation"}:
                 continue
             _selector(ws, child, req, disabled)
             if not req.get("candidates") or req["id"] in _mapping(ws, cid, "customs"):
                 _custom(ws, child, req, disabled)
-    _resolutions(ws, child, disabled)
-    _cost_editor(ws, child, disabled)
+    with st.expander("進階：需求重述／人工成本輸入"):
+        _resolutions(ws, child, disabled)
+        _cost_editor(ws, child, disabled)
     blocked = st.session_state.get("dq_blocked", {}).get(cid)
     if blocked:
         st.error(blocked + "；請重新套用該欄位後才能固定／保存。")
@@ -293,23 +355,33 @@ def _child(ws, child, store):
         except (ValueError, StorageError) as exc:
             st.error(str(exc))
     frozen = ws.frozen.get(cid)
+    confirmed = False
     if frozen:
         document = json.loads(frozen.payload)
         st.text("固定 UUID：" + frozen.confirmation_id)
         with st.expander("固定預覽（尚未保存者無正式單號）", expanded=not saved):
-            st.dataframe(screen_rows(document["child"], document["context"]["catalog_snapshot"], receipt=saved), hide_index=True)
-            st.json(document["frozen_audit"])
+            st.dataframe(compact_rows(document["child"], document["context"]["catalog_snapshot"], receipt=saved), hide_index=True)
+            with st.expander("固定人工稽核"):
+                st.json(document["frozen_audit"])
         confirmed = st.checkbox("我已核對本張固定明細、數量與金額，確認保存", key="dq_confirm:" + frozen.confirmation_id,
                                 disabled=saved is not None or bool(blocked))
-        if st.button("確認保存本張", key="dq_save:" + cid, disabled=saved is not None or not confirmed or bool(blocked)):
-            try:
-                ws.confirm(cid, store, confirmed=True)
-                st.rerun()
-            except (ValueError, StorageError) as exc:
-                st.error(str(exc))
-                st.warning("保存未完成；保留同一固定 UUID，使用本按鈕重試，勿重新建立工單。")
-            except Exception:
-                st.error("保存結果未知；保留同一固定 UUID 重試或查歷史，不另建確認。")
+    if not saved:
+        if not child["ready"]:
+            st.caption("輸出尚未開放：請先處理待選規格、需求及成本缺項（見待處理原因）。")
+        elif not frozen:
+            st.caption("輸出尚未開放：請先固定本張預覽，再核對並勾選確認。")
+        elif not confirmed:
+            st.caption("輸出尚未開放：請勾選已核對本張固定明細、數量與金額。")
+    if st.button("輸出至資料庫報價單（ordqdt_ai）", key="dq_save:" + cid, type="primary",
+                 disabled=saved is not None or not frozen or not confirmed or bool(blocked)):
+        try:
+            ws.confirm(cid, store, confirmed=True)
+            st.rerun()
+        except (ValueError, StorageError) as exc:
+            st.error(str(exc))
+            st.warning("保存未完成；保留同一固定 UUID，使用本按鈕重試，勿重新建立工單。")
+        except Exception:
+            st.error("保存結果未知；保留同一固定 UUID 重試或查歷史，不另建確認。")
 
 
 def _history(store, legacy):

@@ -1,6 +1,20 @@
 # AI 報價助理系統（AI Quotation Assistant System）
 
+## 對話式報價（app.py，2026-11-17）
+
+[`app.py`](app.py) 已改為對話式報價：`./venv/bin/python -m streamlit run app.py`（Windows：`.\venv\Scripts\python.exe -m streamlit run app.py`）。
+
+- **先在對話決定產品類別**，再**一次貼上整份工單**，或**一問一答逐步訂製**；兩種方式走同一套規則，結果相同。
+- 右側報價單：上方列出項目名稱（主席／列席／轉角…，未命名為第1項、第2項）與數量；多個項目可切換查看明細；缺漏以紅字提醒；下方顯示未稅金額、稅率與總額。
+- 規則沿用 [`four_quote_acceptance.py --local-db`](four_quote_acceptance.py) 的本機規則（[`local_quote/dynamic.py`](local_quote/dynamic.py)），**不是 LLM**。主檔唯讀取自 [`.env`](.env) 的本機資料庫。
+- 報價完整（沒有紅字）後，填操作人、勾選確認，按「保存到資料庫（ordqdt_ai）」即逐項保存，**每個項目各自一個單號**（同 ERP 一項一單；`DQ` 單號，與 `four_quote_acceptance.py --local-db` 相同的逐張保存服務）；保存後鎖定。
+- 舊版單品報價與核對工作區改名為 [`legacy_app.py`](legacy_app.py)（`streamlit run legacy_app.py`），功能未變。下方各節提到舊版畫面的 `app.py`，現在都是指 `legacy_app.py`。
+
+操作見[對話式報價操作說明](docs/對話式報價操作說明.md)；驗證結果及與 [logs/sem.txt](logs/sem.txt) 的金額差異見[對話式報價開發報告](docs/對話式報價開發報告.md)。
+
 ## 新版工單逐張報價（2026-10-14）
+
+**2026-11-10：** 已修正唯一包裝費被撕膜需求連帶封鎖、補上「鋁毛刷盒」辨識；13.5×40 與 40×13.5 保留精確換向匹配，銀／黑多候選由使用者在 [`spc_code`](local_quote/dynamic_ui.py:147) 表格下拉選取。主表精簡、技術區收合，並固定顯示[輸出至資料庫報價單按鈕](local_quote/dynamic_ui.py:375)；仍需完整固定及人工確認，不會略過缺項。更新後停止原服務再重啟，不加初始化旗標。[新版操作及514項測試結果](docs/新版工單逐張報價操作說明.md:3)。
 
 本機入口已導向[新版 UI](local_quote/dynamic_ui.py)：[./venv/bin/python four_quote_acceptance.py --local-db](four_quote_acceptance.py:15)。先停止原服務後重啟；不加初始化旗標，不建表、不讀模型設定，仍使用全新程序及本機連線安全邊界。原[四張 UI](local_quote/ui.py)及舊歷史格式保留；新版頁面提供舊四張歷史唯讀查回。
 
@@ -238,7 +252,7 @@
 
 | 層級 | 主要模組 | 主要職責 |
 |---|---|---|
-| UI 層 | [`app.py`](app.py) | Streamlit 頁面、Chat UI、報價預覽、Session State |
+| UI 層 | [`app.py`](app.py)／[`legacy_app.py`](legacy_app.py) | 對話式報價（`local_quote/chat.py`）／舊版 Chat UI、報價預覽、Session State |
 | AI Agent 層 | [`agent/`](agent/) | 意圖解析、欄位檢查、Tool Calling |
 | 資料服務層 | [`database/`](database/) | 資料庫查詢、ORM、Repository |
 | 計價引擎層 | [`engine/`](engine/) | 成本、售價與報價快照計算 |
@@ -247,8 +261,10 @@
 依賴方向（單向解耦）：
 
 ```text
-app.py → agent/ → database/
-              └─→ engine/ → database/
+app.py → local_quote/chat_ui.py → local_quote/chat.py → local_quote/dynamic.py（唯讀主檔）
+                                                      └─→ local_quote/dynamic_storage.py（逐項保存 ordqdt_ai）
+legacy_app.py → agent/ → database/
+                     └─→ engine/ → database/
 ```
 
 ---
@@ -272,7 +288,8 @@ ai_quote_assistant/
 ├── requirements.txt              # 套件依賴清單
 ├── .env                          # 環境變數（API Key、DB 連線字串、產品前綴）
 ├── .env.example                  # 環境變數範本
-├── app.py                        # Streamlit 主程式入口
+├── app.py                        # Streamlit 主程式入口（對話式報價）
+├── legacy_app.py                 # 舊版單品報價與核對工作區
 ├── config.py                     # 系統參數（PRODUCT_PREFIX、REQUIRED_OPTNOS 等）
 │
 ├── agent/                        # AI Agent 核心模組
@@ -466,7 +483,8 @@ WORKGROUP=CMT1
 ### 4. 啟動 Streamlit
 
 ```powershell
-streamlit run app.py
+streamlit run app.py          # 對話式報價（需 .env 的本機 MySQL／MSSQL 主檔）
+streamlit run legacy_app.py   # 舊版單品報價（未設定資料庫時使用 SQLite 範例資料）
 ```
 
 啟動後瀏覽器會自動開啟，或手動前往：`http://localhost:8501`
@@ -525,7 +543,7 @@ WORKGROUP=CMT1
 
 **步驟 3：首次啟動自動建立資料表**
 
-切換到 MSSQL 後，執行 `streamlit run app.py`，系統會自動於資料庫建立所有資料表（`CREATE TABLE IF NOT EXISTS`）。
+切換到 MSSQL 後，執行 `streamlit run legacy_app.py`，系統會自動於資料庫建立所有資料表（`CREATE TABLE IF NOT EXISTS`）。
 
 > **注意**：MSSQL 模式不會自動灌入範例假資料，請連接既有 ERP 資料（ordspd / ordspe / ordqty）。
 > `PRODUCT_PREFIX` 必須與 ERP 中 `ordspd.path` 的前綴完全一致，否則查詢結果為空。

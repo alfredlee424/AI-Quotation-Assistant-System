@@ -117,14 +117,14 @@ def _utf8(value, limit, label):
     return raw
 
 
-def _capacity(snapshot):
+def _capacity(snapshot, document_type=DOCUMENT_TYPE):
     """prepare/save 共用：限制完整邏輯快照，僅必要時壓縮，限制最終封套。"""
     payload = _canonical(snapshot)
     raw = _utf8(payload, MAX_LOGICAL_BYTES, "完整邏輯快照（8 MiB）")
     if len(raw) <= TEXT_BYTES:
         return payload
     compressed = zlib.compress(raw, level=9)
-    envelope = dict(document_type=DOCUMENT_TYPE, document_version=2, algorithm=COMPRESSION,
+    envelope = dict(document_type=document_type, document_version=2, algorithm=COMPRESSION,
                     logical_bytes=len(raw), compressed_bytes=len(compressed),
                     data=base64.b64encode(compressed).decode("ascii"),
                     snapshot_digest=snapshot["snapshot_digest"])
@@ -143,11 +143,11 @@ def _json(payload):
     return result
 
 
-def _load_snapshot(payload):
+def _load_snapshot(payload, document_type=DOCUMENT_TYPE):
     """只解碼自含儲存文件，不接受外部參照或遞迴封套。摘要不依賴壓縮位元組。"""
     _utf8(payload, TEXT_BYTES, "歷史儲存容量（TEXT 65535）")
     stored = _json(payload)
-    _require(isinstance(stored, dict) and stored.get("document_type") == DOCUMENT_TYPE
+    _require(isinstance(stored, dict) and stored.get("document_type") == document_type
              and type(stored.get("document_version")) is int
              and stored["document_version"] in (1, 2),
              "不是支援的新版單張歷史；舊歷史請用 BatchStore")
@@ -185,7 +185,7 @@ def _load_snapshot(payload):
             raise StorageError("壓縮快照不是合法 UTF-8") from None
         snapshot = _json(logical)
     _require(isinstance(snapshot, dict) and set(snapshot) == _FIELDS
-             and snapshot["document_type"] == DOCUMENT_TYPE
+             and snapshot["document_type"] == document_type
              and type(snapshot["document_version"]) is int and snapshot["document_version"] == 1,
              "邏輯快照欄位／版本不符")
     _require(snapshot["snapshot_digest"] == _digest(_canonical(
@@ -340,8 +340,9 @@ class DynamicStore:
             _require(all(actual[k] == wanted[k] for k in ROW_FIELDS), "歷史快照與 ordqdt_ai 明細不符")
         return snapshot
 
-    def _allocate_ref(self, conn):
-        prefix = "DQ" + _now().strftime("%Y%m%d%H%M%S") + "_"
+    def _allocate_ref(self, conn, batch_time=None):
+        """batch_time：同一次保存的多張共用同一時間前綴，流水號依序 _001、_002…。"""
+        prefix = "DQ" + (batch_time or _now()).strftime("%Y%m%d%H%M%S") + "_"
         used = set()
         for table in ("ordqdt_ai", "quote_snapshot_document"):
             suffix = lock_suffix(self.db)
@@ -359,10 +360,14 @@ class DynamicStore:
         rows = _database_rows(snapshot)
         conn.execute(insert_statement(self.db, "ordqdt_ai", rows[0]), rows)
 
-    def save(self, frozen, *, confirmed, current, trusted_catalog_digest):
-        """同一 UUID＋相同內容回原 receipt；任何衝突／殘缺都拒絕補存。"""
+    def save(self, frozen, *, confirmed, current, trusted_catalog_digest, batch_time=None):
+        """同一 UUID＋相同內容回原 receipt；任何衝突／殘缺都拒絕補存。
+
+        batch_time（含時區 datetime）只決定單號的時間前綴，讓同批各張單號連號；保存時間仍為實際時間。"""
         _require(confirmed is True, "必須人工明確確認才可保存")
         _require(isinstance(current, dict), "保存需要可信的最新 analysis")
+        _require(batch_time is None or isinstance(batch_time, datetime) and batch_time.utcoffset() is not None,
+                 "batch_time 必須為含時區的時間")
         _hex(trusted_catalog_digest, 64, "trusted_catalog_digest")
         document = _thaw(frozen)
         dynamic.validate_document(document, current=current, trusted_catalog_digest=trusted_catalog_digest)
@@ -385,7 +390,8 @@ class DynamicStore:
                             _require(snapshot["request_digest"] == frozen.digest and snapshot["document"] == document,
                                      "相同確認 UUID 已保存不同內容")
                         else:
-                            snapshot = _snapshot(frozen, document, self.db.workgroup, self._allocate_ref(conn),
+                            snapshot = _snapshot(frozen, document, self.db.workgroup,
+                                                 self._allocate_ref(conn, batch_time),
                                                  _now().isoformat(timespec="microseconds"), self._profile)
                             payload = _capacity(snapshot)
                             rows = _database_rows(snapshot)  # 全部預檢在任何 INSERT 之前

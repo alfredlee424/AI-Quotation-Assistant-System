@@ -65,8 +65,10 @@ from .catalog import build_catalog, entries, material_groups
 
 VERSION = "dynamic-1"
 PER_ITEM_OPTIONS = frozenset({"S010", "S015", "S020", "S022", "S025", "S030",
-                             "S035", "S040", "S049", "S050", "S055", "S061",
+                             "S035", "S040", "S049", "S050", "S051", "S055", "S061",
                              "W010", "W020", "W030", "W040", "W050", "W060", "W070"})
+# 每件 1／1 用量政策適用的產品類別（同為環式會議桌主檔結構）。
+PER_ITEM_PRODKINDS = frozenset({"CMT1", "CMTA"})
 _INPUTS = ("choices", "customs", "overrides", "resolutions")
 _ITEM = re.compile(r"^(.+?)\s*[-─－—]{2,}\s*([1-9]\d*)(?![\d.])\s*(.*)$")
 _ORDER_HEADER = re.compile(r"^(?:[（(]\s*\d+\s*[）)]\s*)?(\d{8,9}-\d+\s*[^\d\s].*)$")
@@ -589,7 +591,7 @@ class _Child:
                         item["sources"][field] = "ordqty"
                 else:
                     item["sources"].update(stdqty="unresolved_ordqty_driver", stdpar="unresolved_ordqty_driver")
-            elif self.cat["prodkind"] == "CMT1" and nodes[path]["optnoc"] in PER_ITEM_OPTIONS:
+            elif self.cat["prodkind"] in PER_ITEM_PRODKINDS and nodes[path]["optnoc"] in PER_ITEM_OPTIONS:
                 values.update(stdqty="1", stdpar="1")
                 item["sources"].update(stdqty="CMT1_existing_per_item_policy", stdpar="CMT1_existing_per_item_policy")
             if path in self.inputs["overrides"]:

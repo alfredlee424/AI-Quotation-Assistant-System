@@ -13,7 +13,7 @@ from database.models import QuoteSnapshotDocument, ordqdt_ai
 from engine.preview import freeze_preview
 
 
-APP = Path(__file__).resolve().parents[1] / "app.py"
+APP = Path(__file__).resolve().parents[1] / "legacy_app.py"
 
 
 class UIHalt(BaseException):

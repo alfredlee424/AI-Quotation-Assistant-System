@@ -30,7 +30,8 @@ def startup_error(exc):
     return "請檢查已安裝的專案套件、本機連線、工作組及既有七表結構；不會自動建表。"
 
 
-def launch(*, worker=False):
+def launch(*, worker=False, combined=False):
+    """combined=True 啟動不拆單合併報價 UI；預設仍為逐張 UI。"""
     if not worker:
         # 不退回 PATH 或全域 Python，避免使用未安裝專案依賴的環境。
         python = ROOT / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
@@ -43,7 +44,7 @@ def launch(*, worker=False):
         command = [str(python), "-I", "-B", "-c",
                    "import sys; sys.path.insert(0, sys.argv.pop(1)); "
                    "from four_quote_acceptance import main; raise SystemExit(main())",
-                   str(ROOT), "--local-db", "--worker"]
+                   str(ROOT), "--local-db", "--worker"] + (["--combined"] if combined else [])
         try:
             return subprocess.run(command, env=clean_environment(), cwd=ROOT,
                                   stdin=subprocess.DEVNULL, close_fds=True, shell=False).returncode
@@ -82,7 +83,8 @@ def launch(*, worker=False):
         previous_directory = Path.cwd()
         try:
             os.chdir(directory)
-            sys.argv = ["streamlit", "run", str(ROOT / "local_quote/dynamic_ui.py"),
+            ui = "local_quote/combined_ui.py" if combined else "local_quote/dynamic_ui.py"
+            sys.argv = ["streamlit", "run", str(ROOT / ui),
                         "--server.address", "127.0.0.1", "--server.headless", "true",
                         "--browser.gatherUsageStats", "false", "--server.fileWatcherType", "none"]
             runpy.run_module("streamlit", run_name="__main__")

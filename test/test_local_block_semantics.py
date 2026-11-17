@@ -95,7 +95,9 @@ class BlockSemanticsTests(unittest.TestCase):
                 self.assertEqual(result["source_ledger"][0]["scope"], "header")
                 for c in result["children"]:
                     self.assertFalse(requirements(c, "unknown"), c["normalized_requirements"])
-                    self.assertFalse([r for r in requirements(c) if r["status"] == "pending_master"])
+                    # 無單位 ≤10 視為台尺；合成主檔沒有 30.3 公分換算後的近似尺寸，只允許尺寸待主檔。
+                    self.assertFalse([r for r in requirements(c) if r["status"] == "pending_master"
+                                      and not r["value"].get("approximate")])
                     self.assertFalse(c["ready"])  # 原句的圖面或單位未核對，不是假完成。
                     self.assertNotIn("total_cost", c["calc"])
                     self.assertTrue(set(c["active_paths"]) <= self.cat["nodes"].keys())
@@ -165,7 +167,8 @@ class BlockSemanticsTests(unittest.TestCase):
     def test_parts_box_and_round_quantity_no_diameter_as_table_dimension(self):
         for c in self.analyze(case("2-2"))["children"]:
             self.assertEqual(len(requirements(c, "dimension")), 1)
-            self.assertTrue(requirements(c, "dimension")[0]["value"]["confirmation_required"])
+            value = requirements(c, "dimension")[0]["value"]
+            self.assertEqual((value["unit"], value["approximate"], value["confirmation_required"]), ("台尺", True, False))
             self.assertEqual(requirements(c, "hole")[0]["value"], dict(shape="round", diameter="6", unit="cm"))
             self.assertEqual(requirements(c, "box")[0]["quantity"], "1")
             self.assertEqual(requirements(c, "hole")[0]["quantity"], "1")
@@ -177,6 +180,58 @@ class BlockSemanticsTests(unittest.TestCase):
             self.assertNotIn(TOP, c["selections"])  # 3x3.25 即使主檔有同數字也不偷選。
             self.assertNotIn(r"SYN\LEGS\LEGHOLE", c["selections"])
             self.assertEqual(len(requirements(c, "assembly")), 2)
+
+    def test_packaging_single_option_is_independent_of_unmatched_film(self):
+        path = TOP + r"\PACK"
+        self.cat["nodes"][path] = dict(pathf=TOP, pathc=path, optnoc="PACK", optnof="TOP", must_chose="Y")
+        self.cat["labels"]["PACK"] = "包裝費"
+        self.cat["options"][path] = [dict(path=path, code="C001", codsc="包裝", compri="30")]
+        self.cat["rules"][path] = [dict(path=path, part_path=path, code="C001", stdqty="1", stdpar="1")]
+        self.cat["options"][TOP + r"\FILM"][0]["codsc"] = "一般保護膜"
+        result = self.analyze(case("1-1"))
+        for child in result["children"]:
+            self.assertEqual(child["selections"][path]["code"], "C001")
+            film = next(r for r in requirements(child, "assembly") if r["value"] == "remove_protective_film")
+            self.assertEqual(film["status"], "pending_master")
+            self.assertNotIn(path, film["custom_paths"])
+            self.assertFalse(child["ready"])
+            item = next(i for i in child["items"] if i["path"] == path)
+            self.assertEqual(item["qty"], str(child["product_qty"]))
+
+    def test_packaging_explicit_film_option_remains_legal(self):
+        self.cat["labels"]["FILM"] = "包裝費"
+        child = self.analyze("平直70X120-----2 撕保護膜")["children"][0]
+        self.assertEqual(child["selections"][TOP + r"\FILM"]["code"], "REMOVE")
+        self.assertEqual(requirements(child, "assembly")[0]["status"], "matched")
+        self.assertTrue(child["ready"], child["issues"])
+
+    def test_aluminum_brush_box_reverse_axes_keeps_both_colors_and_child_scope(self):
+        path = TOP + r"\BOX"
+        self.cat["labels"]["BOX"] = "鋁毛刷盒"
+        self.cat["options"][path] = [dict(path=path, code=code, codsc=text, compri="29") for code, text in (
+            ("C001", "40*13.5 銀鋁單掀"), ("C002", "40*13.5 黑鋁單掀"),
+            ("C003", "60*13.5 銀鋁單掀"), ("C004", "40*21.5 銀鋁雙掀"))]
+        self.cat["rules"][path] = [dict(path=path, part_path=path, code=o["code"], stdqty="1", stdpar="1")
+                                    for o in self.cat["options"][path]]
+        result = self.analyze(case("1-1"))
+        self.assertNotIn(path, result["children"][0]["selections"])
+        for child in result["children"][1:]:
+            box = requirements(child, "box")[0]
+            self.assertEqual([o["code"] for o in box["candidates"]], ["C001", "C002"])
+            self.assertIsNone(box["selected"])
+            self.assertNotIn(path, child["selections"])
+        child = result["children"][2]
+        box = requirements(child, "box")[0]
+        chosen = self.analyze(case("1-1"), choices={child["id"]: {box["id"]: dict(path=path, code="C002")}})
+        self.assertEqual(chosen["children"][2]["selections"][path]["code"], "C002")
+        item = next(i for i in chosen["children"][2]["items"] if i["path"] == path)
+        self.assertEqual(item["qty"], "6")
+        for index in (0, 1, 3):
+            self.assertEqual(chosen["children"][index], result["children"][index])
+
+    def test_box_alias_inherits_required_cutout_quantity(self):
+        self.cat["labels"]["BOX"] = "鋁毛刷盒"
+        self.test_box_required_cutout_inherits_quantity_without_duplicate_round_holes()
 
     def test_box_required_cutout_inherits_quantity_without_duplicate_round_holes(self):
         box = TOP + r"\BOX"
@@ -342,7 +397,10 @@ class BlockSemanticsTests(unittest.TestCase):
         a = self.analyze("彎角3X3.25-----2")
         c = a["children"][0]
         r = requirements(c, "dimension")[0]
-        self.assertEqual(r["status"], "pending_units")
+        # 視為台尺：90.9×98.475 公分；合成主檔「3*3.25」不是公分近似，不可當候選。
+        self.assertEqual(r["value"]["converted_cm"], ["90.9", "98.475"])
+        self.assertEqual(r["status"], "pending_master")
+        self.assertEqual(r["candidates"], [])
         self.assertNotIn(TOP, c["selections"])
         board = next(i for i in c["items"] if i["path"] == TOP + r"\BOARD")
         self.assertIsNone(board["part_cost"])
